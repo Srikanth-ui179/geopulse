@@ -1,0 +1,74 @@
+[
+  {
+    "id": "art-01",
+    "title": "US and UK launch joint airstrikes on Houthi military positions in Yemen",
+    "url": "https://www.bbc.com/news/world-middle-east-680001",
+    "canonical_url": "https://www.bbc.com/news/world-middle-east-680001",
+    "source_name": "BBC World News",
+    "published_at": "2026-10-22T02:00:00Z",
+    "snippet": "American and British fighter jets carried out targeted airstrikes against Houthi radar and missile sites across western Yemen overnight."
+  },
+  {
+    "id": "art-02",
+    "title": "Yemen: US and British forces strike Houthi missile and radar sites",
+    "url": "https://www.aljazeera.com/news/2026/10/22/us-uk-strikes-yemen-houthis",
+    "canonical_url": "https://www.aljazeera.com/news/2026/10/22/us-uk-strikes-yemen-houthis",
+    "source_name": "Al Jazeera English",
+    "published_at": "2026-10-22T03:30:00Z",
+    "snippet": "Joint military strikes hit several Houthi positions in Sanaa and coastal provinces following attacks on Red Sea shipping."
+  },
+  {
+    "id": "art-03",
+    "title": "Ukrainian drone strikes set ablaze oil depot in Russia's Rostov region",
+    "url": "https://www.bbc.com/news/world-europe-680002",
+    "canonical_url": "https://www.bbc.com/news/world-europe-680002",
+    "source_name": "BBC World News",
+    "published_at": "2026-10-22T05:00:00Z",
+    "snippet": "A long-range Ukrainian drone attack struck a fuel depot in Rostov, triggering a massive industrial blaze according to regional authorities."
+  },
+  {
+    "id": "art-04",
+    "title": "Cross-border shelling damages power substation in Belgorod",
+    "url": "https://www.aljazeera.com/news/2026/10/22/belgorod-shelling-damage",
+    "canonical_url": "https://www.aljazeera.com/news/2026/10/22/belgorod-shelling-damage",
+    "source_name": "Al Jazeera English",
+    "published_at": "2026-10-22T06:00:00Z",
+    "snippet": "Artillery shelling in the Russian border city of Belgorod caused local electrical outages on Thursday morning."
+  },
+  {
+    "id": "art-05",
+    "title": "UK Ministry of Defence signs £400m contract for air defence missiles",
+    "url": "https://www.defensenews.com/land/2026/10/22/uk-mod-missile-contract",
+    "canonical_url": "https://www.defensenews.com/land/2026/10/22/uk-mod-missile-contract",
+    "source_name": "Defense News",
+    "published_at": "2026-10-22T09:00:00Z",
+    "snippet": "The British MoD announced a procurement contract for next-generation short-range air defence systems to boost Army readiness."
+  },
+  {
+    "id": "art-06",
+    "title": "Rebels claim downing of military transport aircraft; army denies loss",
+    "url": "https://www.aljazeera.com/news/2026/10/22/rebels-claim-aircraft-downed",
+    "canonical_url": "https://www.aljazeera.com/news/2026/10/22/rebels-claim-aircraft-downed",
+    "source_name": "Al Jazeera English",
+    "published_at": "2026-10-22T10:00:00Z",
+    "snippet": "Insurgent commanders claimed they shot down an Antonov transport plane, but military spokesmen denied the report as unconfirmed propaganda."
+  },
+  {
+    "id": "art-07",
+    "title": "Premier League match postponed after drone strike near stadium",
+    "url": "https://www.bbc.com/sport/football/680003",
+    "canonical_url": "https://www.bbc.com/sport/football/680003",
+    "source_name": "BBC World News",
+    "published_at": "2026-10-22T11:00:00Z",
+    "snippet": "The football clash between Arsenal and Chelsea was delayed following an isolated security incident in the city centre."
+  },
+  {
+    "id": "art-08",
+    "title": "Hollywood box office hits record high over holiday weekend",
+    "url": "https://www.bbc.com/entertainment/680004",
+    "canonical_url": "https://www.bbc.com/entertainment/680004",
+    "source_name": "BBC World News",
+    "published_at": "2026-10-22T12:00:00Z",
+    "snippet": "Celebrities gathered for red carpet premieres as movie ticket sales surged."
+  }
+]
