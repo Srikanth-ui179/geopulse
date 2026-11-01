@@ -313,13 +313,31 @@ ACTOR_ALIASES: dict[str, str] = {
     "committed": "commit",
     "capabilities": "capability",
     "f-35s": "f-35",
+    "airborne": "air",
 }
 
-# Words signaling contested claims or disputes
+# Words signaling contested claims or disputes (explicit denials, conflicting accounts)
 DISPUTE_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\b(denies|denied|denying|rebuts|rejects|refutes)\b", re.I),
-    re.compile(r"\b(unconfirmed|conflicting claims|disputed|unverified)\b", re.I),
-    re.compile(r"\b(claims without evidence|contradictory accounts)\b", re.I),
+    re.compile(
+        r"\b(denies|denied|denying|rebuts|rebutted|rejects|rejected|refutes|refuted)\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(conflicting claims|contradictory accounts|claims without evidence|"
+        r"mutually exclusive claims|opposing claims)\b",
+        re.I,
+    ),
+    re.compile(
+        r"\b(disputed claim|disputed claims|disputed account|disputed accounts|"
+        r"disputed by|disputed the claim|disputed the account|dispute between)\b",
+        re.I,
+    ),
+)
+
+_GEOGRAPHICAL_DISPUTE_PATTERN: re.Pattern[str] = re.compile(
+    r"\bdisputed\s+(?:[\w-]+\s+){0,3}"
+    r"(?:waters|seas?|borders?|territor\w*|islands?|regions?|zones?|areas?|boundaries|land|corridors?|airspace)\b",
+    re.I,
 )
 
 SHORT_GEOPOLITICAL_ENTITIES: frozenset[str] = frozenset({"us", "uk", "un", "eu"})
@@ -334,8 +352,16 @@ def tokenize(text: str) -> list[str]:
     words = _TOKEN_RE.findall(text.lower())
     tokens: list[str] = []
     for w in words:
-        if (len(w) > 2 or w in SHORT_GEOPOLITICAL_ENTITIES) and w not in STOPWORDS:
-            tokens.append(ACTOR_ALIASES.get(w, w))
+        # Split non-numeric hyphenated compound terms (e.g. 'uk-france', 'nuclear-strike')
+        # while preserving military alphanumerics (e.g. 'f-35')
+        if "-" in w and not re.search(r"\d", w):
+            parts = w.split("-")
+            for part in parts:
+                if (len(part) > 2 or part in SHORT_GEOPOLITICAL_ENTITIES) and part not in STOPWORDS:
+                    tokens.append(ACTOR_ALIASES.get(part, part))
+        else:
+            if (len(w) > 2 or w in SHORT_GEOPOLITICAL_ENTITIES) and w not in STOPWORDS:
+                tokens.append(ACTOR_ALIASES.get(w, w))
     return tokens
 
 
@@ -351,6 +377,39 @@ def extract_bigrams(tokens: list[str]) -> set[tuple[str, str]]:
         if i + 2 < len(tokens):
             pairs.add((min(tokens[i], tokens[i + 2]), max(tokens[i], tokens[i + 2])))
     return pairs
+
+
+# Distinctive policy, strategy, and defence industrial initiative patterns
+_POLICY_IDENTIFIER_PATTERN: re.Pattern[str] = re.compile(
+    r"\b((?:[A-Za-z]+(?:\s+[A-Za-z]+){0,2}\s+)?"
+    r"(?:offset\s+policy|offset\s+guidance|defence\s+offsets?|defense\s+offsets?|"
+    r"procurement\s+offsets?|offset\s+rules?|industrial\s+strategy|"
+    r"defence\s+industrial\s+strategy|strategic\s+defence\s+review|"
+    r"national\s+defence\s+strategy|national\s+security\s+strategy|"
+    r"defence\s+procurement\s+policy))\b|"
+    r"\b(british\s+jobs\s+and\s+skills)\b",
+    re.I,
+)
+
+
+def extract_policy_identifiers(text: str) -> set[str]:
+    """Extract recognized defence policy and procurement initiative identifiers."""
+    if not text:
+        return set()
+    found: set[str] = set()
+    for m in _POLICY_IDENTIFIER_PATTERN.finditer(text):
+        raw = m.group(0).lower().strip()
+        if "offset" in raw or "british jobs and skills" in raw:
+            found.add("offset_policy")
+        elif "defence industrial strategy" in raw or "industrial strategy" in raw:
+            found.add("defence_industrial_strategy")
+        elif "strategic defence review" in raw:
+            found.add("strategic_defence_review")
+        elif "national defence strategy" in raw:
+            found.add("national_defence_strategy")
+        else:
+            found.add(raw)
+    return found
 
 
 def extract_locations(text: str) -> set[str]:
@@ -371,7 +430,10 @@ def has_dispute_indicators(text: str) -> bool:
     """Check if the text contains explicit dispute or contested claim keywords."""
     if not text:
         return False
-    return any(pat.search(text) for pat in DISPUTE_PATTERNS)
+    # Strip geographical descriptors like 'disputed waters' or 'disputed Asian seas'
+    # so sovereignty disputes over geographic areas are not conflated with factual event disputes.
+    clean_text = _GEOGRAPHICAL_DISPUTE_PATTERN.sub("", text)
+    return any(pat.search(clean_text) for pat in DISPUTE_PATTERNS)
 
 
 def jaccard_similarity(set_a: set, set_b: set) -> float:
@@ -476,13 +538,33 @@ def compute_article_similarity(
     # 6. Location and topic alignment bonus
     location_bonus = 0.0
     if locs_a and locs_b and (locs_a & locs_b):
-        location_bonus = 0.15
+        matching_locs = locs_a & locs_b
+        # Enhanced bonus when multiple specific partner nations align (e.g. bilateral exercise)
+        location_bonus = 0.15 + (0.05 if len(matching_locs) >= 2 else 0.0)
 
     topic_bonus = 0.0
     if topic_a and topic_b and topic_a == topic_b and topic_a != TopicCategory.UNCERTAIN:
         topic_bonus = 0.05
 
-    # 7. Composite score combining title, bigram, full-text, cross-containment, and location
+    # 7. Policy and procurement initiative co-reference bonus
+    policy_bonus = 0.0
+    policies_a = extract_policy_identifiers(text_a)
+    policies_b = extract_policy_identifiers(text_b)
+    if policies_a and policies_b and (policies_a & policies_b):
+        policy_topics = {
+            TopicCategory.DEFENCE_POLICY,
+            TopicCategory.WEAPONS_PROCUREMENT,
+            TopicCategory.UNCERTAIN,
+            None,
+        }
+        if topic_a in policy_topics and topic_b in policy_topics:
+            has_shared_entity = bool(locs_a & locs_b) or (
+                article_a.source_name.strip().lower() == article_b.source_name.strip().lower()
+            )
+            if has_shared_entity:
+                policy_bonus = 0.25
+
+    # 8. Composite score combining title, bigram, full-text, cross-containment, and location
     composite = (
         (title_jaccard * 0.30)
         + (bigram_jaccard * 0.15)
@@ -490,6 +572,7 @@ def compute_article_similarity(
         + (cross_containment * 0.20)
         + location_bonus
         + topic_bonus
+        + policy_bonus
     )
 
     # Slight penalty for greater time separation within the 48-hour window
@@ -499,10 +582,56 @@ def compute_article_similarity(
 
 
 _ATTRIBUTION_PATTERN = re.compile(
-    r"\b(?:citing|according to|quoted by|quoting|reported by)\s+(?:[\w-]+\s+){0,4}"
+    r"\b(?:citing|according to|quoted by|quoting|reported by|reporting by|reported in|via)\s+"
+    r"(?:[\w-]+\s+){0,4}"
     r"(tass|ria novosti|interfax|sana|state media|state news agency|kremlin|"
-    r"press release|ministry statement|spokesperson)\b",
+    r"reuters|associated press|\bap\b|afp|agence france-presse|bloomberg|dpa|upi|"
+    r"pentagon|defence department|defense department|white house|"
+    r"press release|ministry statement|official statement|joint statement|"
+    r"spokesperson|spokesman)\b",
     re.I,
+)
+
+_CLAIM_ORIGIN_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "rebel_claim",
+        re.compile(
+            r"\b(?:rebels?|insurgents?|militants?|separatists?)\s+(?:claim|claimed|claims|say|said|announce|announced)\b",
+            re.I,
+        ),
+    ),
+    (
+        "military_spokesperson",
+        re.compile(
+            r"\b(?:military\s+spokesm[ae]n|defence\s+spokesm[ae]n|army\s+spokesm[ae]n|pentagon\s+spokesm[ae]n|"
+            r"spokesperson\s+said|spokesman\s+said|spokesman\s+stated|spokesperson\s+stated)\b",
+            re.I,
+        ),
+    ),
+    (
+        "ministry_announcement",
+        re.compile(
+            r"\b(?:ministry\s+of\s+defen[cs]e|defence\s+ministry|defense\s+ministry|mod|dod)\s+"
+            r"(?:announced|said|stated|confirmed|statement|claims?|claimed)\b",
+            re.I,
+        ),
+    ),
+    (
+        "government_announcement",
+        re.compile(
+            r"\b(?:pentagon|defence\s+department|defense\s+department|white\s+house|"
+            r"state\s+department|foreign\s+ministry)\s+"
+            r"(?:announced|selects?|selected|awards?|awarded|confirms?|confirmed|stated|said)\b",
+            re.I,
+        ),
+    ),
+    (
+        "company_claim",
+        re.compile(
+            r"\b(?:the\s+company\s+(?:claims?|announced|stated|said)|manufacturer\s+(?:claims?|stated))\b",
+            re.I,
+        ),
+    ),
 )
 
 
@@ -530,12 +659,24 @@ def has_single_origin_dependency(
                     f"{other_source} reported",
                     f"{other_source} announced",
                     f"{other_source} statement",
+                    f"{other_source} said",
+                    f"{other_source} confirmed",
+                    f"released by {other_source}",
+                    f"press release from {other_source}",
+                    f"statement from {other_source}",
+                    f"statement by {other_source}",
                 ]
                 if any(pat in text for pat in attrib_patterns):
                     return True, other_source
 
-    # 2. Check if all articles cite the exact same originating wire or agency
+    # 2. Check if all articles in the cluster repeat the exact same combatant or official claim
     all_texts = [f"{a.title} {a.snippet or ''}" for a in articles]
+    for origin_tag, pat in _CLAIM_ORIGIN_PATTERNS:
+        if all(pat.search(t) for t in all_texts):
+            return True, origin_tag
+
+    # 3. Check if all articles cite the exact same originating wire or agency
+    found_entities: list[str] = []
     found_entities: list[str] = []
     for t in all_texts:
         m = _ATTRIBUTION_PATTERN.search(t)
@@ -544,13 +685,36 @@ def has_single_origin_dependency(
 
     if len(found_entities) == len(all_texts):
         first_ent = found_entities[0]
-        wire_synonyms = {"state media", "state news agency", "tass", "ria novosti", "interfax"}
+        state_wire_synonyms = {
+            "state media",
+            "state news agency",
+            "tass",
+            "ria novosti",
+            "interfax",
+        }
+        western_wire_synonyms = {
+            "reuters",
+            "associated press",
+            "ap",
+            "afp",
+            "agence france-presse",
+            "bloomberg",
+        }
+        official_announcements = {
+            "press release",
+            "ministry statement",
+            "official statement",
+            "joint statement",
+            "spokesperson",
+        }
+
         if all(
             ent == first_ent
-            or (ent in wire_synonyms and first_ent in wire_synonyms)
+            or (ent in state_wire_synonyms and first_ent in state_wire_synonyms)
+            or (ent in western_wire_synonyms and first_ent in western_wire_synonyms)
+            or (ent in official_announcements and first_ent in official_announcements)
             for ent in found_entities
         ):
             return True, first_ent
 
     return False, None
-

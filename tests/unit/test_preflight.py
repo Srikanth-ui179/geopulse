@@ -221,9 +221,7 @@ def test_successful_preflight_followed_by_pipeline():
         significance="Advanced hypersonic capabilities.",
         confidence_qualification="Single-source defence reporting",
         sources=(
-            EventSourceAttribution(
-                source_name=art.source_name, title=art.title, url=art.url
-            ),
+            EventSourceAttribution(source_name=art.source_name, title=art.title, url=art.url),
         ),
         model_used="mock-model",
     )
@@ -401,3 +399,81 @@ def test_cluster_preflight_failure_blocks_clustering(monkeypatch, capsys):
     assert "Supabase schema preflight failed" in captured
     assert "Missing required table(s): events" in captured
 
+
+def test_preflight_fails_on_publishable_anon_key():
+    """Verify preflight rejects publishable/anon key before making write attempts."""
+    test_settings = Settings(
+        _env_file=None,
+        supabase_url="https://mock-test.supabase.co",
+        supabase_key="sb_publishable_fakekey12345",
+    )
+    res = run_supabase_preflight(settings=test_settings)
+    assert res.success is False
+    assert res.error_message is not None
+    assert "publishable/anon key" in res.error_message
+    assert "service_role" in res.error_message
+
+
+class MockRpcPreflightClient(MockPreflightSupabaseClient):
+    """Mock client with RPC support for testing preflight stored procedure probing."""
+
+    def __init__(
+        self,
+        rpc_error: Exception | None = None,
+        missing_tables: set[str] | None = None,
+        missing_columns: dict[str, set[str]] | None = None,
+    ) -> None:
+        super().__init__(missing_tables=missing_tables, missing_columns=missing_columns)
+        self.rpc_error = rpc_error
+        self.rpc_calls: list[tuple[str, Any]] = []
+
+    def rpc(self, func_name: str, params: Any = None) -> Any:
+        self.rpc_calls.append((func_name, params))
+        builder = MagicMock()
+        if self.rpc_error is not None:
+            builder.execute.side_effect = self.rpc_error
+        else:
+            res = MagicMock()
+            res.data = {"events_persisted": 0, "articles_linked": 0}
+            builder.execute.return_value = res
+        return builder
+
+
+def test_preflight_rpc_probe_success():
+    """Verify preflight passes when stored procedure exists and returns 0 writes."""
+    client = MockRpcPreflightClient()
+    res = run_supabase_preflight(client=client, scope="cluster")
+    assert res.success is True
+    assert len(client.rpc_calls) == 1
+    func_name, params = client.rpc_calls[0]
+    assert func_name == "upsert_events_with_articles"
+    # Probes with empty arrays ensuring zero writes
+    assert params == {"p_events": [], "p_event_articles": []}
+
+
+def test_preflight_rpc_probe_missing_function():
+    """Verify preflight fails and names migration 006 when procedure is missing."""
+    client = MockRpcPreflightClient(
+        rpc_error=Exception(
+            '{"code": "PGRST202", "message": '
+            '"Could not find the function public.upsert_events_with_articles"}'
+        )
+    )
+    res = run_supabase_preflight(client=client, scope="cluster")
+    assert res.success is False
+    assert "upsert_events_with_articles" in res.missing_functions
+    assert res.details is not None
+    assert "006_atomic_event_persistence.sql" in res.details
+
+
+def test_preflight_rpc_probe_permission_denied():
+    """Verify preflight reports permission denied when RPC execution is forbidden."""
+    client = MockRpcPreflightClient(
+        rpc_error=Exception(
+            "403 Forbidden: permission denied for function upsert_events_with_articles"
+        )
+    )
+    res = run_supabase_preflight(client=client, scope="cluster")
+    assert res.success is False
+    assert res.error_message is not None
+    assert "Permission denied executing RPC" in res.error_message

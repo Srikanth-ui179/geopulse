@@ -5,6 +5,7 @@ import logging
 import time
 from collections.abc import Callable
 from datetime import UTC, date, datetime
+from typing import Any
 
 from geopulse.config import Settings
 from geopulse.delivery.client import BaseTelegramClient, TelegramClient
@@ -65,6 +66,8 @@ class TelegramDeliveryService:
         briefing_date: date | None = None,
         force: bool = False,
         dry_run: bool = False,
+        edition: str | None = None,
+        event_hashes: list[str] | tuple[str, ...] | None = None,
     ) -> DeliveryResult:
         """Deliver digest chunks to Telegram with deduplication, resumption, and retry safety."""
         target_date = briefing_date or date.today()
@@ -75,12 +78,16 @@ class TelegramDeliveryService:
 
         # 1. State check and resumption resolution against repository
         try:
-            existing = self.repository.get_briefing_by_date(target_date)
+            try:
+                existing = self.repository.get_briefing_by_date(target_date, edition=edition)
+            except TypeError:
+                existing = self.repository.get_briefing_by_date(target_date)
         except CorruptDeliveryStateError as exc:
             logger.error("State repository error: %s", exc)
             return DeliveryResult(
                 briefing_id="corrupt-state",
                 briefing_date=target_date,
+                edition=edition,
                 status="failed",
                 chunks_total=total_chunks,
                 chunks_delivered=0,
@@ -91,26 +98,29 @@ class TelegramDeliveryService:
         delivered_message_ids: list[int] = []
         warning_msg: str | None = None
 
-
         if existing:
             # Case A: Already fully sent
             if existing.status == "sent":
                 if not force:
-                    logger.info("Briefing for %s was already delivered. Skipping.", target_date)
-                    delivered_count = (
-                        existing.chunks_delivered or existing.telegram_message_count
+                    edition_label = f" ({edition})" if edition else ""
+                    logger.info(
+                        "Briefing for %s%s was already delivered. Skipping.",
+                        target_date,
+                        edition_label,
                     )
+                    delivered_count = existing.chunks_delivered or existing.telegram_message_count
                     return DeliveryResult(
                         briefing_id=existing.id,
                         briefing_date=target_date,
+                        edition=edition,
                         status="skipped_duplicate",
                         chunks_total=total_chunks,
                         chunks_delivered=delivered_count,
                         message_ids=existing.telegram_message_ids,
                         is_dry_run=dry_run,
                         error_message=(
-                            f"Briefing for {target_date} has already been delivered. "
-                            "Use --force to resend."
+                            f"Briefing for {target_date}{edition_label} "
+                            "has already been delivered. Use --force to resend."
                         ),
                     )
                 logger.info(
@@ -130,6 +140,7 @@ class TelegramDeliveryService:
                     return DeliveryResult(
                         briefing_id=existing.id,
                         briefing_date=target_date,
+                        edition=edition,
                         status="ambiguous",
                         chunks_total=total_chunks,
                         chunks_delivered=existing.chunks_delivered,
@@ -152,7 +163,6 @@ class TelegramDeliveryService:
                     "Previously accepted chunks may be duplicated in the chat."
                 )
 
-
             # Case C: Partial or interrupted delivery exists
             elif existing.status in {"partial", "processing"}:
                 if force:
@@ -167,6 +177,7 @@ class TelegramDeliveryService:
                     return DeliveryResult(
                         briefing_id=existing.id,
                         briefing_date=target_date,
+                        edition=edition,
                         status="partial",
                         chunks_total=total_chunks,
                         chunks_delivered=existing.chunks_delivered,
@@ -192,13 +203,13 @@ class TelegramDeliveryService:
                         total_chunks,
                     )
 
-
         # 2. Dry-run / preview mode: simulate successful delivery without sending
         if dry_run:
             logger.info("Dry-run delivery for %s (%d chunk(s)).", target_date, total_chunks)
             return DeliveryResult(
                 briefing_id="dry-run",
                 briefing_date=target_date,
+                edition=edition,
                 status="sent",
                 chunks_total=total_chunks,
                 chunks_delivered=total_chunks,
@@ -211,6 +222,7 @@ class TelegramDeliveryService:
             return DeliveryResult(
                 briefing_id="lock-blocked",
                 briefing_date=target_date,
+                edition=edition,
                 status="failed",
                 chunks_total=total_chunks,
                 chunks_delivered=0,
@@ -227,16 +239,30 @@ class TelegramDeliveryService:
                 briefing_record = existing
             else:
                 try:
-                    briefing_record = self.repository.create_briefing(
-                        briefing_date=target_date,
-                        total_chunks=total_chunks,
-                        digest_hash=digest_hash,
-                    )
+                    create_kwargs: dict[str, Any] = {
+                        "briefing_date": target_date,
+                        "total_chunks": total_chunks,
+                        "digest_hash": digest_hash,
+                    }
+                    if edition is not None:
+                        create_kwargs["edition"] = edition
+                    if event_hashes is not None:
+                        create_kwargs["event_hashes"] = event_hashes
+
+                    try:
+                        briefing_record = self.repository.create_briefing(**create_kwargs)
+                    except TypeError:
+                        briefing_record = self.repository.create_briefing(
+                            briefing_date=target_date,
+                            total_chunks=total_chunks,
+                            digest_hash=digest_hash,
+                        )
                 except Exception as exc:
                     logger.error("Failed to create briefing state record: %s", exc)
                     return DeliveryResult(
                         briefing_id="create-failed",
                         briefing_date=target_date,
+                        edition=edition,
                         status="failed",
                         chunks_total=total_chunks,
                         chunks_delivered=0,
@@ -277,6 +303,7 @@ class TelegramDeliveryService:
                         briefing_record = BriefingRecord(
                             id=briefing_record.id,
                             briefing_date=target_date,
+                            edition=edition,
                             status="processing",
                             started_at=briefing_record.started_at,
                             completed_at=None,
@@ -284,6 +311,7 @@ class TelegramDeliveryService:
                             chunks_delivered=len(delivered_message_ids),
                             telegram_message_ids=tuple(delivered_message_ids),
                             digest_hash=digest_hash,
+                            delivered_event_hashes=tuple(event_hashes or ()),
                         )
                         self.repository.update_briefing(briefing_record)
                         break
@@ -376,6 +404,7 @@ class TelegramDeliveryService:
             updated_record = BriefingRecord(
                 id=briefing_record.id,
                 briefing_date=target_date,
+                edition=edition,
                 status=final_status,
                 started_at=briefing_record.started_at,
                 completed_at=now_dt if is_complete else None,
@@ -384,12 +413,14 @@ class TelegramDeliveryService:
                 telegram_message_ids=tuple(delivered_message_ids),
                 error_message=error_msg,
                 digest_hash=digest_hash,
+                delivered_event_hashes=briefing_record.delivered_event_hashes,
             )
             self.repository.update_briefing(updated_record)
 
             return DeliveryResult(
                 briefing_id=briefing_record.id,
                 briefing_date=target_date,
+                edition=edition,
                 status=final_status,
                 chunks_total=total_chunks,
                 chunks_delivered=len(delivered_message_ids),
@@ -404,6 +435,7 @@ class TelegramDeliveryService:
             return DeliveryResult(
                 briefing_id="corrupt-state",
                 briefing_date=target_date,
+                edition=edition,
                 status="failed",
                 chunks_total=total_chunks,
                 chunks_delivered=len(delivered_message_ids),
@@ -413,4 +445,3 @@ class TelegramDeliveryService:
             )
         finally:
             self.repository.release_lock()
-

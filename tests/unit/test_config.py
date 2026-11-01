@@ -117,3 +117,97 @@ def test_get_settings_cached():
     s2 = get_settings()
     assert s1 is s2
 
+
+def test_classify_supabase_key_categories():
+    import base64
+    import json
+
+    from geopulse.config import classify_supabase_key
+
+    def _make_jwt(role: str) -> str:
+        h = base64.urlsafe_b64encode(b'{"alg":"HS256"}').decode().rstrip("=")
+        p = base64.urlsafe_b64encode(json.dumps({"role": role}).encode()).decode().rstrip("=")
+        return f"{h}.{p}.sig"
+
+    assert classify_supabase_key("sb_publishable_abc123") == "publishable/anon"
+    assert classify_supabase_key("sb_secret_xyz789") == "newer secret key"
+    assert classify_supabase_key(_make_jwt("service_role")) == "legacy service_role"
+    assert classify_supabase_key(_make_jwt("anon")) == "publishable/anon"
+    assert classify_supabase_key("generic-opaque-token") == "unknown"
+    assert classify_supabase_key(None) == "unknown"
+
+
+def test_settings_supabase_key_category():
+    s_anon = Settings(_env_file=None, supabase_key="sb_publishable_123456")
+    assert s_anon.supabase_key_category == "publishable/anon"
+
+    s_sec = Settings(_env_file=None, supabase_key="sb_secret_123456")
+    assert s_sec.supabase_key_category == "newer secret key"
+
+    s_none = Settings(_env_file=None, supabase_key=None)
+    assert s_none.supabase_key_category == "unknown"
+
+
+def test_feed_limit_default_and_validation(monkeypatch):
+    monkeypatch.delenv("FEED_LIMIT", raising=False)
+    s = Settings(_env_file=None)
+    assert s.feed_limit == 10
+
+    s_custom = Settings(_env_file=None, feed_limit=25)
+    assert s_custom.feed_limit == 25
+
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, feed_limit=0)
+
+
+def test_gemini_defaults_and_provider_settings(monkeypatch):
+    for key in ("GEMINI_API_KEY", "GEMINI_MODEL", "LLM_PROVIDER"):
+        monkeypatch.delenv(key, raising=False)
+
+    s = Settings(_env_file=None)
+    assert s.llm_provider == "ollama"
+    assert s.gemini_api_key is None
+    assert s.gemini_model == "gemini-3.8-flash"
+    assert s.gemini_base_url == "https://generativelanguage.googleapis.com"
+    assert s.is_gemini_configured is False
+
+
+def test_gemini_require_when_configured():
+    s = Settings(
+        _env_file=None,
+        gemini_api_key="test-gemini-key",
+        gemini_model="gemini-3.8-flash",
+    )
+    assert s.is_gemini_configured is True
+    key, model = s.require_gemini()
+    assert key == "test-gemini-key"
+    assert model == "gemini-3.8-flash"
+    assert "test-gemini-key" not in repr(s)
+
+
+def test_gemini_require_when_missing():
+    s = Settings(_env_file=None)
+    with pytest.raises(ValueError, match="Gemini is not configured"):
+        s.require_gemini()
+
+
+def test_empty_gemini_api_key_normalizes_to_none():
+    s = Settings(_env_file=None, gemini_api_key="   ")
+    assert s.gemini_api_key is None
+    assert s.is_gemini_configured is False
+
+
+def test_invalid_gemini_base_url_is_rejected():
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, gemini_base_url="not-a-url")
+
+
+def test_invalid_llm_provider_is_rejected():
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, llm_provider="openai")
+
+
+def test_valid_llm_providers_accepted():
+    for p in ("ollama", "gemini", "auto", "OLLAMA", "Gemini", "AUTO"):
+        s = Settings(_env_file=None, llm_provider=p)
+        assert s.llm_provider == p.lower()

@@ -18,8 +18,10 @@ from geopulse.ingestion.models import ArticleRecord
 
 ANALYSIS_SOURCES: frozenset[str] = frozenset({"war on the rocks"})
 ANALYSIS_TITLE_PATTERNS: re.Pattern[str] = re.compile(
-    r"\b(analysis|commentary|opinion|interview|exclusive interview|"
-    r"strategic review|perspective|cogs of war|book review|essay)\b",
+    r"\b(analysis|analyst\s+argues|analysts?\b|commentary|op-ed|opinion|interview|"
+    r"exclusive interview|strategic review|perspective|cogs of war|book review|essay|"
+    r"roundtable|discussion|podcast|debrief|newsletter|reading list|"
+    r"lessons?\s+(?:from|for)|should inform)\b",
     re.I,
 )
 
@@ -56,20 +58,19 @@ class _ClusterBuilder:
 
     def to_event_cluster(self) -> EventCluster:
         distinct_sources = {a.source_name.strip().lower() for a in self.articles}
+        distinct_article_urls = {a.canonical_url for a in self.articles if a.canonical_url}
         confidence: ConfidenceLabel
 
         if self.has_dispute:
             confidence = "disputed"
-        elif len(distinct_sources) == 1:
+        elif len(distinct_sources) < 2 or len(distinct_article_urls) < 2:
             confidence = "single_source"
-        elif len(distinct_sources) >= 2:
+        else:
             is_derived, _ = has_single_origin_dependency(self.articles)
             if is_derived:
                 confidence = "single_source"
             else:
                 confidence = "corroborated"
-        else:
-            confidence = "uncertain"
 
         # Determine inferred region if available
         region = next(iter(sorted(self.locations)), None)
@@ -125,6 +126,8 @@ class EventClusterer:
                 disputed_clusters=0,
                 uncertain_clusters=0,
                 clusters=(),
+                total_articles_evaluated=0,
+                articles_filtered_out=0,
             )
 
         # 1. Deterministic sort: order by timestamp (published or fetched) then canonical_url
@@ -159,13 +162,16 @@ class EventClusterer:
                 if abs(article_time - builder.last_seen_at) > self.max_time_delta:
                     continue
 
-                # Compute similarity against representative (first) article in cluster
-                sim = compute_article_similarity(
-                    article_a=article,
-                    article_b=builder.articles[0],
-                    max_time_delta=self.max_time_delta,
-                    topic_a=topic,
-                    topic_b=builder.category,
+                # Compute similarity across articles in cluster builder
+                sim = max(
+                    compute_article_similarity(
+                        article_a=article,
+                        article_b=existing_article,
+                        max_time_delta=self.max_time_delta,
+                        topic_a=topic,
+                        topic_b=builder.category,
+                    )
+                    for existing_article in builder.articles
                 )
 
                 if sim >= self.similarity_threshold and sim > highest_score:
@@ -179,21 +185,25 @@ class EventClusterer:
 
         # 4. Finalize immutable event clusters (breaking news first, analysis de-prioritized)
         raw_clusters = [b.to_event_cluster() for b in builders]
-        final_clusters = tuple(
-            sorted(raw_clusters, key=lambda c: 1 if c.is_analysis else 0)
-        )
+        final_clusters = tuple(sorted(raw_clusters, key=lambda c: 1 if c.is_analysis else 0))
 
         corroborated = sum(1 for c in final_clusters if c.confidence_label == "corroborated")
         single_source = sum(1 for c in final_clusters if c.confidence_label == "single_source")
         disputed = sum(1 for c in final_clusters if c.confidence_label == "disputed")
         uncertain = sum(1 for c in final_clusters if c.confidence_label == "uncertain")
 
+        total_evaluated = len(articles)
+        classified_count = len(classified)
+        filtered_out = total_evaluated - classified_count
+
         return ClusteringSummary(
-            total_articles=len(classified),
+            total_articles=classified_count,
             total_clusters=len(final_clusters),
             corroborated_clusters=corroborated,
             single_source_clusters=single_source,
             disputed_clusters=disputed,
             uncertain_clusters=uncertain,
             clusters=final_clusters,
+            total_articles_evaluated=total_evaluated,
+            articles_filtered_out=filtered_out,
         )

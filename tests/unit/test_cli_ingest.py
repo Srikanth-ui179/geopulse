@@ -58,8 +58,14 @@ def test_cli_ingest_unknown_feed_filter_fails(capsys):
 
 
 def test_cli_ingest_persist_without_credentials_fails(monkeypatch, capsys):
-    monkeypatch.delenv("SUPABASE_URL", raising=False)
-    monkeypatch.delenv("SUPABASE_KEY", raising=False)
+    from geopulse import cli as cli_mod
+    from geopulse.config import Settings
+
+    monkeypatch.setattr(
+        cli_mod,
+        "Settings",
+        lambda: Settings(_env_file=None, supabase_url=None, supabase_key=None),
+    )
 
     result = main(["ingest", "--persist"])
     captured = capsys.readouterr().out
@@ -187,3 +193,89 @@ def test_cli_cluster_subcommand_executes_cleanly(monkeypatch, capsys):
     assert "Event Clustering Summary:" in captured
     assert "Events Formed:      1" in captured
 
+
+def test_cli_cluster_persist_flow_ingests_and_links_articles(monkeypatch, capsys):
+    from geopulse.config import Settings
+    from geopulse.preflight import PreflightResult
+
+    sample_article = ArticleRecord(
+        source_name="BBC World News",
+        title="Ukrainian drone strikes set ablaze oil depot in Russia's Rostov region",
+        url="https://bbc.com/rostov-depot",
+        canonical_url="https://bbc.com/rostov-depot",
+        content_hash="mock-hash-222",
+        relevance_status="relevant",
+    )
+    mock_summary = IngestionSummary(
+        total_feeds=1,
+        successful_feeds=1,
+        failed_feeds=0,
+        total_articles_fetched=1,
+        total_articles_new=1,
+        feed_results=[
+            FeedIngestionResult(
+                feed_name="BBC World News",
+                feed_url="https://example.com/feed",
+                success=True,
+                articles_fetched=1,
+                articles_new=1,
+                articles=[sample_article],
+            )
+        ],
+    )
+
+    ingest_kwargs_captured = {}
+
+    def mock_run_ingest(**kwargs):
+        ingest_kwargs_captured.update(kwargs)
+        return mock_summary
+
+    persisted_events_args = {}
+
+    class FakeEvRepo:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def persist_events(self, events, article_url_to_id=None):
+            persisted_events_args["events"] = events
+            persisted_events_args["article_url_to_id"] = article_url_to_id
+            return len(events), len(events)
+
+    class FakeArtRepo:
+        client = None
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_article_ids_by_urls(self, urls):
+            return {u: f"uuid-{u}" for u in urls}
+
+    monkeypatch.setattr(
+        "geopulse.cli.Settings",
+        lambda: Settings(
+            _env_file=None,
+            supabase_url="https://test.supabase.co",
+            supabase_key="sb_secret_fake_key_12345",
+        ),
+    )
+    monkeypatch.setattr(
+        "geopulse.cli.run_supabase_preflight",
+        lambda **kwargs: PreflightResult(success=True),
+    )
+    monkeypatch.setattr("geopulse.cli.run_ingestion", mock_run_ingest)
+    monkeypatch.setattr("geopulse.cli.SupabaseArticleRepository", FakeArtRepo)
+    monkeypatch.setattr("geopulse.cli.SupabaseEventRepository", FakeEvRepo)
+
+    result = main(["cluster", "--persist"])
+    captured = capsys.readouterr().out
+    assert result == 0
+    # Ingestion was run with dry_run=False and repository supplied
+    assert ingest_kwargs_captured.get("dry_run") is False
+    assert isinstance(ingest_kwargs_captured.get("repository"), FakeArtRepo)
+    # Event repo received resolved article_url_to_id
+    assert "article_url_to_id" in persisted_events_args
+    assert (
+        persisted_events_args["article_url_to_id"].get("https://bbc.com/rostov-depot")
+        == "uuid-https://bbc.com/rostov-depot"
+    )
+    assert "Persisted 1 event cluster(s) to Supabase." in captured

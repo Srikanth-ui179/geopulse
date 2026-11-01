@@ -1,6 +1,6 @@
 """Offline tests for Phase 6B end-to-end persistent pipeline wiring."""
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import MagicMock
 
 from geopulse.classification.models import TopicCategory
@@ -70,9 +70,7 @@ def test_end_to_end_pipeline_orchestration_fake_repositories():
         significance="Strengthens regional deterrence capabilities.",
         confidence_qualification="Corroborated by two independent defense outlets",
         sources=(
-            EventSourceAttribution(
-                source_name=art1.source_name, title=art1.title, url=art1.url
-            ),
+            EventSourceAttribution(source_name=art1.source_name, title=art1.title, url=art1.url),
         ),
         model_used="mock-mistral:latest",
     )
@@ -327,8 +325,13 @@ def test_missing_credentials_fails_safely_without_network():
 
 def test_cli_cluster_persist_without_credentials_fails_safely(capsys, monkeypatch):
     """Verify CLI cluster --persist fails safely when credentials absent."""
-    monkeypatch.delenv("SUPABASE_URL", raising=False)
-    monkeypatch.delenv("SUPABASE_KEY", raising=False)
+    from geopulse import cli as cli_mod
+
+    monkeypatch.setattr(
+        cli_mod,
+        "Settings",
+        lambda: Settings(_env_file=None, supabase_url=None, supabase_key=None),
+    )
 
     ret = main(["cluster", "--persist"])
     captured = capsys.readouterr().out
@@ -338,8 +341,13 @@ def test_cli_cluster_persist_without_credentials_fails_safely(capsys, monkeypatc
 
 def test_cli_brief_persist_without_credentials_fails_safely(capsys, monkeypatch):
     """Verify CLI brief --persist fails safely when credentials absent."""
-    monkeypatch.delenv("SUPABASE_URL", raising=False)
-    monkeypatch.delenv("SUPABASE_KEY", raising=False)
+    from geopulse import cli as cli_mod
+
+    monkeypatch.setattr(
+        cli_mod,
+        "Settings",
+        lambda: Settings(_env_file=None, supabase_url=None, supabase_key=None),
+    )
 
     ret = main(["brief", "--persist"])
     captured = capsys.readouterr().out
@@ -800,6 +808,11 @@ def test_retry_after_summary_update_failure_heals_state():
 def test_structured_summary_persistence_and_reconstruction():
     """Verify SupabaseEventRepository updates migration 005 columns and reconstructs summary."""
     from geopulse.clustering.repository import SupabaseEventRepository, reconstruct_event_summary
+    from geopulse.summarization.models import (
+        ClaimEvidenceReference,
+        EventSourceAttribution,
+        SummaryClaim,
+    )
 
     mock_client = MagicMock()
     mock_table = MagicMock()
@@ -824,6 +837,29 @@ def test_structured_summary_persistence_and_reconstruction():
         ),
         significance="Threatens Black Sea commercial grain corridor.",
         confidence_qualification="Corroborated by Ukrainian Navy and local port authority",
+        sources=(
+            EventSourceAttribution(
+                source_name="Fixture News",
+                title="Port strike details",
+                url="https://fixture.test/port-strike",
+            ),
+        ),
+        claims=(
+            SummaryClaim(
+                claim_id="c1",
+                text="A missile strike damaged grain storage facilities.",
+                evidence_refs=(
+                    ClaimEvidenceReference(
+                        source_url="https://fixture.test/port-strike",
+                        evidence_span="A missile strike damaged grain storage facilities.",
+                        verification_status="accepted",
+                    ),
+                ),
+                classification="reported_fact",
+                central=True,
+                verification_status="accepted",
+            ),
+        ),
         model_used="deepseek-r1:8b",
     )
 
@@ -856,6 +892,10 @@ def test_structured_summary_persistence_and_reconstruction():
         "location": "Odesa, Ukraine",
         "timing": "Overnight",
         "action": "Missile strike on port grain silos",
+        "_evidence": {
+            "claims": [summary_obj.claims[0].model_dump(mode="json")],
+            "sources": [summary_obj.sources[0].model_dump(mode="json")],
+        },
     }
     assert update_payload["confidence_qualification"] == summary_obj.confidence_qualification
     assert update_payload["model_used"] == "deepseek-r1:8b"
@@ -884,6 +924,27 @@ def test_structured_summary_persistence_and_reconstruction():
     assert reconstructed.key_details.location == "Odesa, Ukraine"
     assert reconstructed.significance == "Threatens Black Sea commercial grain corridor."
     assert reconstructed.model_used == "deepseek-r1:8b"
+    assert reconstructed.claims == summary_obj.claims
+    assert reconstructed.sources == summary_obj.sources
+    assert reconstructed.confidence_qualification == (
+        "Single-source reporting; not independently verified."
+    )
+
+
+def test_reconstructed_summary_without_claim_evidence_is_not_labeled_corroborated():
+    from geopulse.summarization.models import reconstruct_event_summary
+
+    summary = reconstruct_event_summary(
+        {
+            "id": "legacy-event",
+            "summary": "A stored legacy summary without claim evidence.",
+            "confidence_qualification": "Corroborated by multiple outlets",
+        }
+    )
+
+    assert summary is not None
+    assert summary.claims == ()
+    assert summary.confidence_qualification == "Source evidence unavailable; confidence unverified."
 
 
 def test_reconstruct_event_summary_missing_data_returns_none():
@@ -981,3 +1042,253 @@ def test_cli_brief_contradictory_flags_rejected_closed(capsys):
     captured = capsys.readouterr().out
     assert ret == 1
     assert "Error: Cannot specify both persistent state and --state-file." in captured
+
+
+def test_pipeline_run_with_max_events_cap():
+    """Verify BriefingPipeline passes max_events to digest formatting."""
+    art1, art2 = _create_sample_articles()
+    today_date = date(2026, 10, 23)
+
+    pipeline = BriefingPipeline(
+        settings=Settings(_env_file=None),
+        article_repo=InMemoryArticleRepository(),
+        event_repo=InMemoryEventRepository(),
+        delivery_repo=InMemoryDeliveryRepository(),
+        summarizer=MagicMock(
+            summarize_events=lambda evts: [
+                SummarizationResult(
+                    event_id=e.id,
+                    event=e,
+                    status="success",
+                    summary=EventSummary(
+                        event_id=e.id,
+                        headline=f"Headline for {e.title}",
+                        what_happened="Substantive operational military details occurred.",
+                        key_details=EventKeyDetails(
+                            actors=("Military",),
+                            location="Region",
+                            timing="Today",
+                            action="Action",
+                        ),
+                        confidence_qualification="Single-source report",
+                        sources=(),
+                        model_used="test-model",
+                    ),
+                )
+                for e in evts
+            ]
+        ),
+    )
+
+    res = pipeline.run(
+        briefing_date=today_date,
+        articles=[art1, art2],
+        persistent=False,
+        send=False,
+        max_events=1,
+    )
+
+    assert res.is_preview
+    assert len(res.digest_chunks) == 1
+    assert res.is_preview
+    assert len(res.digest_chunks) == 1
+    assert "Editorial Note: Briefing capped at top 1 events." in res.digest_chunks[0]
+
+
+def test_end_to_end_consequential_diplomacy_survives_cap_and_lookback():
+    """End-to-end verification that consequential diplomacy survives capping and lookback rules."""
+    today_date = date(2026, 10, 27)
+    now_dt = datetime(2026, 10, 27, 10, 0, 0, tzinfo=UTC)
+
+    # 1. Fresh consequential diplomacy (12h ago)
+    art_peace_fresh = ArticleRecord(
+        source_name="Global Wire Service",
+        title="Envoys agree to indefinite ceasefire and declare tripartite peace summit to restart",
+        url="https://wire.example.com/fresh-peace-summit",
+        canonical_url="https://wire.example.com/fresh-peace-summit",
+        published_at=now_dt - timedelta(hours=12),
+        snippet="Opposing belligerents agree to cease all hostilities and restart peace talks.",
+        content_hash="hash-peace-fresh",
+    )
+
+    # 2. Older peace announcement (96h ago, outside 48h lookback)
+    art_peace_old = ArticleRecord(
+        source_name="Regional Dispatch",
+        title="Diplomats concluded preliminary peace talks and truce discussions in Geneva",
+        url="https://dispatch.example.com/old-peace-talks",
+        canonical_url="https://dispatch.example.com/old-peace-talks",
+        published_at=now_dt - timedelta(hours=96),
+        snippet="Delegates met last week for initial talks regarding potential truce terms.",
+        content_hash="hash-peace-old",
+    )
+
+    # 3. Routine weapons procurement announcements (14h, 16h, 18h ago)
+    procurement_arts = [
+        ArticleRecord(
+            source_name="Defence Industry News",
+            title="Army awards major contract for radar components and interceptor missiles",
+            url="https://defenceind.example.com/proc-1",
+            canonical_url="https://defenceind.example.com/proc-1",
+            published_at=now_dt - timedelta(hours=14),
+            snippet="Military procurement branch finalizes hardware manufacturing deal.",
+            content_hash="hash-proc-1",
+        ),
+        ArticleRecord(
+            source_name="Maritime Defense Review",
+            title="Navy orders advanced coastal patrol vessels for territorial fleet",
+            url="https://maritime.example.com/proc-2",
+            canonical_url="https://maritime.example.com/proc-2",
+            published_at=now_dt - timedelta(hours=16),
+            snippet="Naval leadership signs agreement for new offshore patrol ships.",
+            content_hash="hash-proc-2",
+        ),
+        ArticleRecord(
+            source_name="Aerospace Daily",
+            title="Air force acquires tactical surveillance drones and sensor pods",
+            url="https://aero.example.com/proc-3",
+            canonical_url="https://aero.example.com/proc-3",
+            published_at=now_dt - timedelta(hours=18),
+            snippet="Aviation command confirms purchase of unmanned aerial systems.",
+            content_hash="hash-proc-3",
+        ),
+    ]
+
+    # 4. Historical military commemorations (15h, 17h ago)
+    historical_arts = [
+        ArticleRecord(
+            source_name="National Defence Ministry",
+            title="First World War soldier buried with military honours after remains identified",
+            url="https://mod.example.com/wwi-burial-somme",
+            canonical_url="https://mod.example.com/wwi-burial-somme",
+            published_at=now_dt - timedelta(hours=15),
+            snippet="CWGC service held as fallen soldier laid to rest on the Somme.",
+            content_hash="hash-hist-1",
+        ),
+        ArticleRecord(
+            source_name="National Defence Ministry",
+            title="Centenary commemoration held for fallen First World War battalions",
+            url="https://mod.example.com/wwi-centenary",
+            canonical_url="https://mod.example.com/wwi-centenary",
+            published_at=now_dt - timedelta(hours=17),
+            snippet="Memorial service conducted for soldiers who perished in 1916 battles.",
+            content_hash="hash-hist-2",
+        ),
+    ]
+
+    # 5. Lower-priority defence policy announcements (19h, 20h ago)
+    policy_arts = [
+        ArticleRecord(
+            source_name="Strategic Affairs Monitor",
+            title=f"Ministry discusses internal headquarters administrative reorganisation {i + 1}",
+            url=f"https://stratmon.example.com/policy-{i + 1}",
+            canonical_url=f"https://stratmon.example.com/policy-{i + 1}",
+            published_at=now_dt - timedelta(hours=19 + i),
+            snippet="Officials review departmental reporting structures and office procedures.",
+            content_hash=f"hash-policy-{i + 1}",
+        )
+        for i in range(2)
+    ]
+
+    # 6. Analytical commentary (21h ago)
+    art_analysis = ArticleRecord(
+        source_name="Security Journal",
+        title="Theoretical retrospective on historical military alliances and deterrence strategy",
+        url="https://journal.example.com/analysis-deterrence",
+        canonical_url="https://journal.example.com/analysis-deterrence",
+        published_at=now_dt - timedelta(hours=21),
+        snippet="Academic analysis evaluates long-term strategic doctrine across decades.",
+        content_hash="hash-analysis-1",
+    )
+
+    all_synthetic_articles = (
+        [art_peace_fresh, art_peace_old]
+        + procurement_arts
+        + historical_arts
+        + policy_arts
+        + [art_analysis]
+    )
+
+    pipeline = BriefingPipeline(
+        settings=Settings(_env_file=None),
+        article_repo=InMemoryArticleRepository(),
+        event_repo=InMemoryEventRepository(),
+        delivery_repo=InMemoryDeliveryRepository(),
+        summarizer=MagicMock(
+            summarize_events=lambda evts: [
+                SummarizationResult(
+                    event_id=e.id,
+                    event=e,
+                    status="success",
+                    summary=EventSummary(
+                        event_id=e.id,
+                        headline=f"Briefing Event: {e.title}",
+                        what_happened=(
+                            "Substantive operational military or diplomatic details occurred."
+                        ),
+                        key_details=EventKeyDetails(
+                            actors=("Envoys", "Officials"),
+                            location="Region",
+                            timing="Within past 24 hours",
+                            action="Reported action",
+                        ),
+                        confidence_qualification="Single-source report; unverified independently.",
+                        sources=(
+                            EventSourceAttribution(
+                                source_name=e.articles[0].source_name,
+                                title=e.articles[0].title,
+                                url=e.articles[0].url,
+                            ),
+                        )
+                        if e.articles
+                        else (),
+                        model_used="mock-model",
+                    ),
+                )
+                for e in evts
+            ]
+        ),
+    )
+
+    # Run the pipeline with lookback_hours=48 and max_events=3
+    res = pipeline.run(
+        briefing_date=today_date,
+        articles=all_synthetic_articles,
+        persistent=False,
+        send=False,
+        max_events=3,
+        lookback_hours=48,
+    )
+
+    assert res.is_preview
+    assert len(res.digest_chunks) >= 1
+    digest_text = "\n".join(res.digest_chunks)
+
+    # 1. Consequential fresh diplomacy survives the cap
+    assert "ceasefire and declare tripartite peace summit" in digest_text
+
+    # 2. Older peace announcement outside 48h lookback is excluded
+    assert "old-peace-talks" not in digest_text
+    assert "Diplomats concluded preliminary peace talks" not in digest_text
+
+    # 3. Historical commemorations do not displace eligible consequential diplomacy
+    pos_peace = digest_text.find("ceasefire and declare tripartite peace summit")
+    assert pos_peace != -1
+    pos_hist = digest_text.find("First World War soldier buried")
+    if pos_hist != -1:
+        assert pos_peace < pos_hist
+
+    # 4. Total selected events equals max_events cap
+    # Lookback excluded art_peace_old (9 articles remain: 1 peace, 3 proc, 2 hist, 2 pol, 1 anal)
+    # With max_events=3, exactly 3 events are selected and remaining are omitted
+    assert "[#1/3]" in digest_text
+    assert "[#2/3]" in digest_text
+    assert "[#3/3]" in digest_text
+    assert "[#4/" not in digest_text
+
+    # 5. Omission note accurately counts omitted events
+    assert "Editorial Note: Briefing capped at top 3 events." in digest_text
+    assert "lower-priority event(s) omitted to maintain digest length." in digest_text
+
+    # 6. Telegram chunk limits respected
+    for chunk in res.digest_chunks:
+        assert len(chunk) <= 4000

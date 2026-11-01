@@ -25,9 +25,7 @@ def load_fixture_articles() -> list[ArticleRecord]:
     records: list[ArticleRecord] = []
     for item in raw:
         published_dt = (
-            datetime.fromisoformat(item["published_at"])
-            if item.get("published_at")
-            else None
+            datetime.fromisoformat(item["published_at"]) if item.get("published_at") else None
         )
         records.append(
             ArticleRecord(
@@ -57,6 +55,20 @@ def test_multiple_sources_covering_same_event_are_merged_and_corroborated():
     assert cluster.article_count == 2
     sources = {a.source_name for a in cluster.articles}
     assert sources == {"BBC World News", "Al Jazeera English"}
+
+
+def test_duplicate_article_url_does_not_create_corroborated_source_count():
+    article = load_fixture_articles()[0]
+    duplicate_link = article.model_copy(
+        update={"source_name": "Reuters", "content_hash": "duplicate-url-other-outlet"}
+    )
+
+    summary = cluster_articles([article, duplicate_link])
+
+    assert summary.total_clusters == 1
+    event = summary.clusters[0]
+    assert event.source_count == 1
+    assert event.confidence_label == "single_source"
 
 
 def test_different_events_in_same_conflict_remain_separate():
@@ -491,5 +503,155 @@ def test_operational_events_precede_analytical_essays_in_cluster_ordering():
     assert "chip war" in summary.clusters[1].title.lower()
 
 
+def test_multiple_outlets_repeating_same_combatant_claim_remain_single_source():
+    """Two outlets repeating the same unconfirmed combatant claim must NOT be corroborated."""
+    base_time = datetime(2026, 10, 26, 10, 0, 0, tzinfo=UTC)
+    art1 = ArticleRecord(
+        source_name="BBC World News",
+        title="Rebels claim downing of military transport aircraft in northern province",
+        url="https://bbc.com/news/rebels-claim-plane",
+        canonical_url="https://bbc.com/news/rebels-claim-plane",
+        published_at=base_time,
+        snippet=(
+            "Insurgent commanders claim their forces shot down a cargo transport "
+            "plane over the sector."
+        ),
+        content_hash="hash-rebel-1",
+        relevance_status="relevant",
+    )
+    art2 = ArticleRecord(
+        source_name="Al Jazeera English",
+        title="Rebels claim military transport aircraft downed over northern province",
+        url="https://aljazeera.com/news/rebels-claim-plane",
+        canonical_url="https://aljazeera.com/news/rebels-claim-plane",
+        published_at=base_time + timedelta(minutes=20),
+        snippet=(
+            "Rebel commanders claim an Antonov transport plane was hit by anti-aircraft artillery."
+        ),
+        content_hash="hash-rebel-2",
+        relevance_status="relevant",
+    )
+
+    summary = cluster_articles([art1, art2])
+    assert summary.total_clusters == 1
+    cluster = summary.clusters[0]
+    # Repeating the same original claim does not imply independent corroboration
+    assert cluster.confidence_label == "single_source"
+    assert cluster.source_count == 2
 
 
+def test_procurement_lesson_article_clustered_as_analysis():
+    """Articles with titles/snippets indicating analytical lessons are tagged is_analysis=True."""
+    from geopulse.clustering.clusterer import EventClusterer
+
+    now = datetime(2026, 10, 24, 12, 0, tzinfo=UTC)
+    art = ArticleRecord(
+        source_name="Defense News",
+        title="How the F-15 and F-22 should inform the F-47’s procurement",
+        url="https://dn.com/f47-lessons",
+        canonical_url="https://dn.com/f47-lessons",
+        published_at=now,
+        snippet=(
+            "Budgetary lessons from the two legacy aircraft can help the Air Force "
+            "anticipate hard choices for the new F-47, one analyst argues."
+        ),
+        content_hash="hash-f47-cl",
+    )
+    clusterer = EventClusterer()
+    summary = clusterer.cluster_articles([art])
+    assert summary.total_clusters == 1
+    cluster = summary.clusters[0]
+    assert cluster.is_analysis is True
+
+
+def test_uk_offset_policy_announcement_and_guidance_consolidated():
+    """Two UK Ministry of Defence documents regarding the UK Offset Policy consolidate into one."""
+    now = datetime(2026, 10, 30, 10, 0, tzinfo=UTC)
+    art1 = ArticleRecord(
+        source_name="UK Ministry of Defence",
+        title="Defence contracts to prioritise British jobs and skills",
+        url=(
+            "https://www.gov.uk/government/news/"
+            "defence-contracts-to-prioritise-british-jobs-and-skills"
+        ),
+        canonical_url=(
+            "https://www.gov.uk/government/news/"
+            "defence-contracts-to-prioritise-british-jobs-and-skills"
+        ),
+        published_at=now,
+        snippet=(
+            "The new UK Offset Policy will require foreign defence contractors winning major "
+            "tenders to invest in UK domestic industry, supply chains, and British jobs and skills."
+        ),
+        content_hash="hash-uk-offset-news",
+    )
+    art2 = ArticleRecord(
+        source_name="UK Ministry of Defence",
+        title="The UK Ministry of Defence announces the UK Offset Policy...",
+        url="https://www.gov.uk/government/publications/uk-offset-policy",
+        canonical_url="https://www.gov.uk/government/publications/uk-offset-policy",
+        published_at=now + timedelta(minutes=15),
+        snippet=(
+            "Statutory guidance on the UK Offset Policy requiring suppliers on selected overseas "
+            "defence and security procurements to invest in the UK economy."
+        ),
+        content_hash="hash-uk-offset-pub",
+    )
+
+    clusterer = EventClusterer()
+    summary = clusterer.cluster_articles([art1, art2])
+
+    assert summary.total_clusters == 1
+    cluster = summary.clusters[0]
+    assert len(cluster.articles) == 2
+    urls = {a.canonical_url for a in cluster.articles}
+    assert art1.canonical_url in urls
+    assert art2.canonical_url in urls
+
+
+def test_uk_mod_unrelated_articles_remain_separate_negative_control():
+    """Unrelated articles from the same publisher (UK MoD) remain in separate clusters."""
+    now = datetime(2026, 10, 30, 10, 0, tzinfo=UTC)
+    art_policy = ArticleRecord(
+        source_name="UK Ministry of Defence",
+        title="Defence contracts to prioritise British jobs and skills",
+        url="https://www.gov.uk/government/news/defence-contracts-to-prioritise-british-jobs-and-skills",
+        canonical_url="https://www.gov.uk/government/news/defence-contracts-to-prioritise-british-jobs-and-skills",
+        published_at=now,
+        snippet=(
+            "The new UK Offset Policy will require foreign defence contractors to invest in UK "
+            "industry and British jobs and skills."
+        ),
+        content_hash="hash-uk-offset",
+    )
+    # Negative control 1: Naval operational security incident
+    art_naval = ArticleRecord(
+        source_name="UK Ministry of Defence",
+        title="Royal Navy intercepts Russian surveillance vessel in English Channel",
+        url="https://www.gov.uk/government/news/royal-navy-intercepts-russian-vessel",
+        canonical_url="https://www.gov.uk/government/news/royal-navy-intercepts-russian-vessel",
+        published_at=now + timedelta(hours=2),
+        snippet="HMS Iron Duke shadowed a Russian intelligence ship passing through the Channel.",
+        content_hash="hash-uk-naval",
+    )
+    # Negative control 2: Routine administrative pension guidance
+    art_pension = ArticleRecord(
+        source_name="UK Ministry of Defence",
+        title="Armed Forces Pension Scheme annual benefit statements update",
+        url="https://www.gov.uk/government/publications/armed-forces-pension-update",
+        canonical_url="https://www.gov.uk/government/publications/armed-forces-pension-update",
+        published_at=now + timedelta(hours=3),
+        snippet=(
+            "Guidance on pension entitlements and annual benefit statements for serving personnel."
+        ),
+        content_hash="hash-uk-pension",
+    )
+
+    clusterer = EventClusterer()
+    # 1. Policy vs Naval patrol -> Must NOT merge
+    summary_naval = clusterer.cluster_articles([art_policy, art_naval])
+    assert summary_naval.total_clusters == 2
+
+    # 2. Policy vs Pension update -> Must NOT merge
+    summary_pension = clusterer.cluster_articles([art_policy, art_pension])
+    assert summary_pension.total_clusters == 2

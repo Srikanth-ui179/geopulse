@@ -1,0 +1,123 @@
+{
+  "battle_of_bailen": {
+    "title": "The Importance of the Battle of Bailén",
+    "source_name": "War on the Rocks",
+    "url": "https://warontherocks.com/the-importance-of-the-battle-of-bailen/",
+    "snippet": "Early on the morning of July 16, 1808, Captain-General Francisco Javier Castaños of the Army of Andalusia launched a surprise attack against the divided forces of Emperor Napoleon Bonaparte’s Army of the Gironde. After three grueling days of combat, French Gen. Pierre Dupont requested an armistice.",
+    "published_at": "2026-10-26T08:30:00Z",
+    "hallucinated_output": {
+      "headline": "US General Urges NATO to Emphasize 'Flexibility' in Future Military Exercises",
+      "what_happened": "According to a recent article by War on the Rocks, General Mark Milley emphasized the need for NATO to prioritize 'flexibility' in its future military exercises, citing the importance of adaptability in a rapidly changing security environment.",
+      "key_details": {
+        "actors": ["General Mark Milley", "NATO"],
+        "location": "Unspecified in reporting",
+        "timing": "October 26, 2026",
+        "action": "military exercises"
+      },
+      "significance": null,
+      "confidence_qualification": "Single-source report from War on the Rocks; unverified independently."
+    }
+  },
+  "current_military_development": {
+    "title": "Ukrainian forces down Russian Su-34 fighter-bomber over Zaporizhzhia front",
+    "source_name": "BBC World News",
+    "url": "https://www.bbc.com/news/world-europe-690001",
+    "snippet": "Air defence units shot down a Russian Su-34 strike aircraft operating over the southern Zaporizhzhia frontline on Monday, according to Ukrainian military spokesmen.",
+    "published_at": "2026-10-26T11:00:00Z",
+    "valid_output": {
+      "headline": "Ukrainian air defence shoots down Russian Su-34 fighter over Zaporizhzhia",
+      "what_happened": "Ukrainian air defence units shot down a Russian Su-34 strike jet over the Zaporizhzhia frontline, according to military spokesmen.",
+      "key_details": {
+        "actors": ["Ukrainian forces", "Russian Su-34"],
+        "location": "Zaporizhzhia frontline",
+        "timing": "Monday",
+        "action": "Downing of strike aircraft"
+      },
+      "significance": "Degrades tactical air support capabilities along the southern sector.",
+      "confidence_qualification": "Single-source report from BBC World News; military claims unconfirmed independently."
+    }
+  },
+  "current_defence_policy_opinion": {
+    "title": "US military needs urgent revolutionary institutional change to prepare for modern war, Petraeus says",
+    "source_name": "Defense News",
+    "url": "https://www.defensenews.com/pentagon/2026/10/23/us-military-needs-urgent-change-petraeus/",
+    "snippet": "Retired Army Gen. David Petraeus stated that the US military must rapidly adapt institutional commands for autonomous warfare, while praising the new Autonomous Warfare Command.",
+    "published_at": "2026-10-23T19:39:00Z",
+    "valid_output": {
+      "headline": "Petraeus urges urgent institutional change for US military autonomous warfare",
+      "what_happened": "According to David Petraeus: The US military must rapidly adapt institutional commands for modern autonomous war.",
+      "key_details": {
+        "actors": ["David Petraeus", "US military", "Autonomous Warfare Command"],
+        "location": "United States",
+        "timing": "October 23, 2026",
+        "action": "Call for institutional reform"
+      },
+      "significance": "Reflects senior leadership pressure for restructuring.",
+      "confidence_qualification": "Single-source report from Defense News; reflects statements by Petraeus and unverified independently."
+    }
+  },
+  "historical_story_with_news_hook": {
+    "title": "Middlesex Regiment soldier laid to rest on the Somme",
+    "source_name": "UK Ministry of Defence",
+    "url": "https://www.gov.uk/government/news/middlesex-regiment-soldier-laid-to-rest-on-the-somme",
+    "snippet": "Private Percy Tolliday, who went missing in action during the Battle of the Somme, has been identified through DNA testing and laid to rest on the Somme alongside two unknown soldiers.",
+    "published_at": "2026-10-26T12:00:00Z",
+    "valid_output": {
+      "headline": "UK MoD identifies WWI Somme soldier Percy Tolliday through DNA testing",
+      "what_happened": "Private Percy Tolliday, missing since the Battle of the Somme, was identified via DNA testing and laid to rest on the Somme by the UK Ministry of Defence.",
+      "key_details": {
+        "actors": ["Private Percy Tolliday", "UK Ministry of Defence"],
+        "location": "the Somme",
+        "timing": "110 years after disappearance",
+        "action": "Burial and identification via DNA testing"
+      },
+      "significance": null,
+      "confidence_qualification": "Single-source report from UK Ministry of Defence; unverified independently."
+    }
+  },
+  "source_too_little_text": {
+    "title": "Briefing note",
+    "source_name": "Defense News",
+    "url": "https://www.defensenews.com/briefing-note",
+    "snippet": "Read more.",
+    "published_at": "2026-10-26T07:00:00Z"
+  },
+  "entity_in_unrelated_context": {
+    "title": "Air Force general attends cultural diplomatic dinner in Vienna",
+    "source_name": "Breaking Defense",
+    "url": "https://breakingdefense.com/general-attends-dinner",
+    "snippet": "General Thomas attended an evening banquet celebrating academic partnerships with Austrian university chancellors.",
+    "published_at": "2026-10-26T06:00:00Z",
+    "fabricated_military_output": {
+      "headline": "General Thomas launches major military air assault in Vienna",
+      "what_happened": "General Thomas executed a heavy airstrike operation across Austrian targets.",
+      "key_details": {
+        "actors": ["General Thomas", "Austrian military"],
+        "location": "Vienna",
+        "timing": "October 26, 2026",
+        "action": "Airstrike assault"
+      },
+      "significance": "Major escalation",
+      "confidence_qualification": "Single-source report from Breaking Defense; unverified independently."
+    }
+  },
+  "model_output_invents_entity": {
+    "title": "Is the Pentagon’s demand signal for drones working? It depends on who you ask.",
+    "source_name": "Breaking Defense",
+    "url": "https://breakingdefense.com/drones-demand",
+    "snippet": "The Pentagon's demand signal for drones is viewed as mixed, with Performance Drone Works CEO James Slider emphasizing the need for sustained normalization.",
+    "published_at": "2026-10-26T14:28:00Z",
+    "fabricated_output": {
+      "headline": "Secretary Austin and NATO Sign $5 Billion Lockheed Martin Missile Agreement in Warsaw",
+      "what_happened": "Secretary Austin announced a major NATO defense contract with Lockheed Martin in Poland.",
+      "key_details": {
+        "actors": ["Secretary Austin", "NATO", "Lockheed Martin"],
+        "location": "Warsaw, Poland",
+        "timing": "October 26, 2026",
+        "action": "Signed missile agreement"
+      },
+      "significance": "Expands NATO air defense.",
+      "confidence_qualification": "Single-source report; unverified independently."
+    }
+  }
+}

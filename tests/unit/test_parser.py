@@ -1,5 +1,7 @@
 """Unit tests for feedparser-based RSS/Atom content parsing."""
 
+from datetime import UTC, datetime
+
 from geopulse.ingestion.parser import parse_feed_content
 
 SAMPLE_RSS_XML = """<?xml version="1.0" encoding="UTF-8"?>
@@ -91,6 +93,69 @@ def test_parse_valid_atom_feed():
     assert entry.author == "MoD Press Office"
     assert "Joint NATO training" in (entry.snippet or "")
     assert entry.relevance_status == "relevant"
+
+
+def test_parse_prefers_longer_feed_supplied_article_body_for_grounding():
+    """Use RSS content:encoded/Atom content when it carries more article evidence."""
+    xml = """<?xml version="1.0"?>
+    <rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+      <channel><title>Defense News</title>
+        <item>
+          <title>AUKUS exercise tests autonomous systems</title>
+          <link>https://example.com/aukus</link>
+          <description>Partners tested uncrewed systems.</description>
+          <content:encoded><![CDATA[<p>Partners tested more than 40 uncrewed technologies,
+          including an anti-submarine warfare component.</p>]]></content:encoded>
+        </item>
+      </channel>
+    </rss>"""
+    articles = parse_feed_content(xml, source_name="Defense News")
+    assert len(articles) == 1
+    assert "more than 40 uncrewed technologies" in (articles[0].snippet or "")
+    assert "anti-submarine warfare" in (articles[0].snippet or "")
+
+
+def test_parse_feed_content_fields_ignore_trailing_boilerplate_and_deduplicate():
+    """Content and summary duplicates plus feed chrome resolve to substantive text."""
+    atom = """<?xml version="1.0" encoding="utf-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <title>Defense News</title>
+      <entry>
+        <title>AUKUS exercise tests maritime systems</title>
+        <link rel="alternate" href="https://example.com/aukus-fields"/>
+        <summary>AUKUS partners tested maritime systems during the exercise.</summary>
+        <content type="html"><![CDATA[<p>AUKUS partners tested maritime systems during
+          the exercise.</p>
+          <p>Subscribe to our newsletter for updates. Related stories: unrelated background.</p>]]>
+        </content>
+      </entry>
+    </feed>"""
+    fixed_time = datetime(2026, 10, 29, 8, 0, tzinfo=UTC)
+    first = parse_feed_content(atom, "Defense News", fetched_at=fixed_time)[0]
+    second = parse_feed_content(atom, "Defense News", fetched_at=fixed_time)[0]
+    assert first.snippet == "AUKUS partners tested maritime systems during the exercise."
+    assert first.snippet == second.snippet
+    assert first.content_hash == second.content_hash
+
+
+def test_parse_ignores_long_unrelated_content_when_excerpt_matches_headline():
+    """Longer but unrelated content metadata does not replace a relevant excerpt."""
+    xml = """<?xml version="1.0"?>
+    <rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/">
+      <channel><title>Defense News</title><item>
+        <title>Ethiopia and Tigray leaders discuss renewed tensions</title>
+        <link>https://example.com/tigray</link>
+        <description>Ethiopian federal authorities and Tigrayan leaders discussed
+          renewed tensions.</description>
+        <content:encoded><![CDATA[<p>A long unrelated profile covers
+        naval procurement, aircraft maintenance, shipyards, budget policy, and technology
+        programs.</p>]]></content:encoded>
+      </item></channel>
+    </rss>"""
+    parsed = parse_feed_content(xml, "Defense News")[0]
+    assert parsed.snippet == (
+        "Ethiopian federal authorities and Tigrayan leaders discussed renewed tensions."
+    )
 
 
 def test_parse_skips_entries_missing_title_or_link():

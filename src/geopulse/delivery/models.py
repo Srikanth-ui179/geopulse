@@ -24,6 +24,7 @@ class BriefingRecord(BaseModel):
 
     id: str
     briefing_date: date
+    edition: str | None = None
     status: Literal["pending", "processing", "sent", "partial", "failed", "ambiguous"] = "pending"
     started_at: datetime
     completed_at: datetime | None = None
@@ -32,6 +33,7 @@ class BriefingRecord(BaseModel):
     chunks_delivered: int = 0
     telegram_message_ids: tuple[int, ...] = Field(default_factory=tuple)
     digest_hash: str | None = None
+    delivered_event_hashes: tuple[str, ...] = Field(default_factory=tuple)
 
 
 class DeliveryResult(BaseModel):
@@ -41,6 +43,7 @@ class DeliveryResult(BaseModel):
 
     briefing_id: str
     briefing_date: date
+    edition: str | None = None
     status: Literal["sent", "partial", "failed", "skipped_duplicate", "ambiguous"]
     chunks_total: int
     chunks_delivered: int
@@ -49,4 +52,3 @@ class DeliveryResult(BaseModel):
     error_message: str | None = None
     warning_message: str | None = None
     resumed_from_chunk: int = 0
-

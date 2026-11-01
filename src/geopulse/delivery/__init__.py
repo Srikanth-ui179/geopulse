@@ -4,6 +4,7 @@ from geopulse.delivery.client import BaseTelegramClient, MockTelegramClient, Tel
 from geopulse.delivery.exceptions import (
     CorruptDeliveryStateError,
     TelegramConfigError,
+    TelegramConflictError,
     TelegramDeliveryError,
     TelegramDuplicateDeliveryError,
     TelegramNetworkError,
@@ -46,6 +47,7 @@ __all__ = [
     "SupabaseDeliveryRepository",
     "TelegramClient",
     "TelegramConfigError",
+    "TelegramConflictError",
     "TelegramDeliveryError",
     "TelegramDeliveryService",
     "TelegramDigestFormatter",

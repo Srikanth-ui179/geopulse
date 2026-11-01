@@ -165,6 +165,7 @@ def test_delivery_service_partial_delivery_state():
         def send_message(self, text, **kwargs):
             if "Chunk 2" in text:
                 from geopulse.delivery.exceptions import TelegramPermanentError
+
                 raise TelegramPermanentError(400, "Parse error in Chunk 2")
             return super().send_message(text, **kwargs)
 
@@ -466,8 +467,3 @@ def test_delivery_service_fails_closed_on_corrupt_state_file(tmp_path):
     assert "invalid JSON" in (result.error_message or "")
     # Absolutely zero Telegram messages must be sent
     assert len(client.sent_messages) == 0
-
-
-
-
-

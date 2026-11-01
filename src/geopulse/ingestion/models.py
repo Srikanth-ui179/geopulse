@@ -45,6 +45,7 @@ class FeedIngestionResult(BaseModel):
     articles_new: int = 0
     articles: list[ArticleRecord] = Field(default_factory=list)
     error_message: str | None = None
+    elapsed_seconds: float = 0.0
 
 
 class IngestionSummary(BaseModel):

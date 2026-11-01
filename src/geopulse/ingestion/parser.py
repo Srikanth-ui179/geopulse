@@ -1,6 +1,7 @@
 """Feedparser-based parsing of RSS and Atom entries into normalized article records."""
 
 import logging
+import re
 from datetime import UTC, datetime
 from typing import Any
 
@@ -59,6 +60,100 @@ def extract_entry_author(entry: dict[str, Any]) -> str | None:
     return None
 
 
+_FEED_BOILERPLATE = re.compile(
+    r"\b(?:subscribe to (?:our )?newsletter|sign up for (?:our )?newsletter|"
+    r"you may also like|related stories|read more:|all rights reserved|"
+    r"cookie policy|terms of use|advertisement)\b.*$",
+    re.I,
+)
+_FEED_STOPWORDS = frozenset(
+    {"and", "the", "for", "with", "from", "into", "over", "under", "about", "after", "during"}
+)
+
+
+def _feed_terms(value: str) -> set[str]:
+    """Return simple content words for conservative cross-field relevance checks."""
+    return {
+        word for word in re.findall(r"[a-z0-9]{3,}", value.lower()) if word not in _FEED_STOPWORDS
+    }
+
+
+def extract_entry_text(entry: dict[str, Any], title: str = "") -> str | None:
+    """Extract the most informative text already supplied by the feed entry.
+
+    Some feeds provide only a short RSS summary while placing the article body in
+    Atom ``content`` or RSS ``content:encoded``. Never fetch article URLs here.
+    """
+    candidates: list[str] = []
+    content = entry.get("content")
+    if isinstance(content, list):
+        for item in content:
+            value = item.get("value") if isinstance(item, dict) else None
+            cleaned = _clean_feed_candidate(value) if isinstance(value, str) else None
+            if cleaned:
+                candidates.append(cleaned)
+
+    for key in ("summary", "description"):
+        value = entry.get(key)
+        cleaned = _clean_feed_candidate(value) if isinstance(value, str) else None
+        if cleaned:
+            candidates.append(cleaned)
+
+    # Remove exact duplicates so a repeated body cannot win merely by appearing in
+    # multiple content fields. If a long candidate is unrelated to the headline but
+    # a shorter excerpt is on-topic, discard the unrelated candidate.
+    unique_candidates = list(dict.fromkeys(candidates))
+    title_terms = _feed_terms(title)
+    if title_terms and len(unique_candidates) > 1:
+        candidate_terms = {value: _feed_terms(value) for value in unique_candidates}
+
+        def is_related(left: set[str], right: set[str]) -> bool:
+            overlap = len(left & right)
+            denominator = min(len(left), len(right))
+            return denominator > 0 and overlap >= 2 and overlap / denominator >= 0.2
+
+        on_topic = []
+        for value in unique_candidates:
+            shares_title_terms = is_related(title_terms, candidate_terms[value])
+            shares_excerpt_terms = any(
+                is_related(candidate_terms[value], other_terms)
+                for other, other_terms in candidate_terms.items()
+                if other != value
+            )
+            if shares_title_terms or shares_excerpt_terms:
+                on_topic.append(value)
+        if on_topic:
+            unique_candidates = on_topic
+
+    # Feed bodies can contain navigation and subscription material. Bound prompt/storage
+    # growth while retaining the longest substantive feed-supplied excerpt.
+    return max(unique_candidates, key=len, default=None)[:12000] if unique_candidates else None
+
+
+_SPONSORED_TEASER = re.compile(
+    r"(?:^|\s+)\[sponsored(?:\s+content)?\][^.\n]*(?:\.|$)",
+    re.I,
+)
+
+_NEWSLETTER_INTRO_BOILERPLATE = re.compile(
+    r"^\s*(?:welcome to (?:the adversarial|our newsletter)[^.\n]*(?:\.|\n)|"
+    r"read more below\.\s*(?:\*{3,}|---|___)?\s*)",
+    re.I,
+)
+
+
+def _clean_feed_candidate(value: str) -> str | None:
+    """Clean HTML and remove trailing feed chrome, sponsored teasers, and intro boilerplate."""
+    cleaned = clean_text(value)
+    if not cleaned:
+        return None
+    cleaned = _FEED_BOILERPLATE.sub("", cleaned).strip()
+    cleaned = _SPONSORED_TEASER.sub(" ", cleaned).strip()
+    cleaned = _NEWSLETTER_INTRO_BOILERPLATE.sub(" ", cleaned).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or None
+
+
 def parse_feed_content(
     raw_content: str,
     source_name: str,
@@ -99,7 +194,7 @@ def parse_feed_content(
             continue
         seen_canonical_urls.add(canonical_url)
 
-        snippet = clean_text(entry.get("summary") or entry.get("description"))
+        snippet = extract_entry_text(entry, title=title)
         published_at = parse_entry_timestamp(entry)
         author = extract_entry_author(entry)
         content_hash = compute_content_hash(canonical_url, title, snippet)

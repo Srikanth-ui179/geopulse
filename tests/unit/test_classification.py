@@ -326,8 +326,6 @@ def test_capability_development_vs_procurement_accuracy():
     assert res_contract.primary_topic == TopicCategory.WEAPONS_PROCUREMENT
 
 
-
-
 def test_procurement_and_diplomacy_topics_accurately_classified():
     res_proc = classify_text(
         title="Denmark orders long-range missiles for new strike brigade",
@@ -411,3 +409,16 @@ def test_naval_carrier_voyages_classified_as_military_operations():
     assert res.primary_topic == TopicCategory.MILITARY_OPERATIONS
 
 
+def test_energy_sanctions_waiver_with_battlefield_mention_classified_as_sanctions():
+    """Energy sanctions waiver mentioning battlefield funding maps to SANCTIONS."""
+    res = classify_text(
+        title="Trump says Russian diesel deal can save lives, ease US energy crunch",
+        snippet=(
+            "The agreement, which eases sanctions on certain Russian refined petroleum "
+            "products, has drawn scrutiny over whether revenue could flow back to "
+            "Moscow's battlefield efforts."
+        ),
+        source_name="Defense News",
+    )
+    assert res.relevance_status == "relevant"
+    assert res.primary_topic == TopicCategory.SANCTIONS

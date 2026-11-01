@@ -20,8 +20,12 @@ class DeliveryRepository(ABC):
     """Abstract interface for briefing delivery lifecycle tracking."""
 
     @abstractmethod
-    def get_briefing_by_date(self, briefing_date: date) -> BriefingRecord | None:
-        """Retrieve existing briefing record for a specific date, if any."""
+    def get_briefing_by_date(
+        self,
+        briefing_date: date,
+        edition: str | None = None,
+    ) -> BriefingRecord | None:
+        """Retrieve existing briefing record for a specific date and edition, if any."""
         ...
 
     @abstractmethod
@@ -30,6 +34,8 @@ class DeliveryRepository(ABC):
         briefing_date: date,
         total_chunks: int,
         digest_hash: str | None = None,
+        edition: str | None = None,
+        event_hashes: list[str] | tuple[str, ...] | None = None,
     ) -> BriefingRecord:
         """Create a new briefing run record in 'processing' status."""
         ...
@@ -38,6 +44,10 @@ class DeliveryRepository(ABC):
     def update_briefing(self, record: BriefingRecord) -> BriefingRecord:
         """Update existing briefing status, chunk metrics, and error state."""
         ...
+
+    def get_latest_briefing(self) -> BriefingRecord | None:
+        """Retrieve the most recently sent briefing record, if any."""
+        return None
 
     def record_briefing_events(
         self,
@@ -65,7 +75,7 @@ class InMemoryDeliveryRepository(DeliveryRepository):
     """In-memory delivery repository for testing and dry-run execution."""
 
     def __init__(self) -> None:
-        self._records: dict[date, BriefingRecord] = {}
+        self._records: dict[tuple[date, str | None], BriefingRecord] = {}
         self._briefing_events: dict[str, list[dict[str, Any]]] = {}
         self._briefing_evidence: dict[str, list[dict[str, Any]]] = {}
         self._is_locked = False
@@ -115,6 +125,12 @@ class InMemoryDeliveryRepository(DeliveryRepository):
                             key_details_data = dict(s.key_details)
                     if key_details_data and "actors" in key_details_data:
                         key_details_data["actors"] = list(key_details_data["actors"])
+                    if getattr(s, "claims", None):
+                        key_details_data = key_details_data or {}
+                        key_details_data["_evidence"] = {
+                            "claims": [claim.model_dump(mode="json") for claim in s.claims],
+                            "sources": [source.model_dump(mode="json") for source in s.sources],
+                        }
                     conf_qual = getattr(s, "confidence_qualification", None)
                     model_used_text = getattr(s, "model_used", None)
             elif hasattr(res_item, "headline"):
@@ -157,31 +173,54 @@ class InMemoryDeliveryRepository(DeliveryRepository):
     def release_lock(self) -> None:
         self._is_locked = False
 
-
-    def get_briefing_by_date(self, briefing_date: date) -> BriefingRecord | None:
-        return self._records.get(briefing_date)
+    def get_briefing_by_date(
+        self,
+        briefing_date: date,
+        edition: str | None = None,
+    ) -> BriefingRecord | None:
+        clean_edition = edition.strip().lower() if edition else None
+        rec = self._records.get((briefing_date, clean_edition))
+        if rec is not None:
+            return rec
+        if clean_edition is None:
+            for (d, _), r in self._records.items():
+                if d == briefing_date:
+                    return r
+        return None
 
     def create_briefing(
         self,
         briefing_date: date,
         total_chunks: int,
         digest_hash: str | None = None,
+        edition: str | None = None,
+        event_hashes: list[str] | tuple[str, ...] | None = None,
     ) -> BriefingRecord:
+        clean_edition = edition.strip().lower() if edition else None
         record_id = str(uuid.uuid4())
         rec = BriefingRecord(
             id=record_id,
             briefing_date=briefing_date,
+            edition=clean_edition,
             status="processing",
             started_at=datetime.now(UTC),
             telegram_message_count=total_chunks,
             digest_hash=digest_hash,
+            delivered_event_hashes=tuple(event_hashes or ()),
         )
-        self._records[briefing_date] = rec
+        self._records[(briefing_date, clean_edition)] = rec
         return rec
 
     def update_briefing(self, record: BriefingRecord) -> BriefingRecord:
-        self._records[record.briefing_date] = record
+        clean_edition = record.edition.strip().lower() if record.edition else None
+        self._records[(record.briefing_date, clean_edition)] = record
         return record
+
+    def get_latest_briefing(self) -> BriefingRecord | None:
+        sent_records = [r for r in self._records.values() if r.status == "sent"]
+        if not sent_records:
+            return None
+        return max(sent_records, key=lambda r: r.completed_at or r.started_at)
 
     def clear(self) -> None:
         self._records.clear()
@@ -325,11 +364,29 @@ class JsonFileDeliveryRepository(DeliveryRepository):
                 except OSError:
                     pass
 
-    def get_briefing_by_date(self, briefing_date: date) -> BriefingRecord | None:
+    @staticmethod
+    def _make_key(briefing_date: date, edition: str | None = None) -> str:
+        if edition and edition.strip():
+            return f"{briefing_date.isoformat()}_{edition.strip().lower()}"
+        return briefing_date.isoformat()
+
+    def get_briefing_by_date(
+        self,
+        briefing_date: date,
+        edition: str | None = None,
+    ) -> BriefingRecord | None:
         data = self._load_data()
-        key = briefing_date.isoformat()
+        key = self._make_key(briefing_date, edition)
         if key not in data:
-            return None
+            if edition is None:
+                for k, v in data.items():
+                    if k.startswith(briefing_date.isoformat()) and isinstance(v, dict):
+                        key = k
+                        break
+                else:
+                    return None
+            else:
+                return None
         row = data[key]
         if not isinstance(row, dict):
             raise CorruptDeliveryStateError(
@@ -346,14 +403,14 @@ class JsonFileDeliveryRepository(DeliveryRepository):
                 else datetime.now(UTC)
             )
             completed_dt = (
-                datetime.fromisoformat(row["completed_at"])
-                if row.get("completed_at")
-                else None
+                datetime.fromisoformat(row["completed_at"]) if row.get("completed_at") else None
             )
 
+            raw_hashes = row.get("delivered_event_hashes") or ()
             return BriefingRecord(
                 id=str(row.get("id", uuid.uuid4())),
                 briefing_date=briefing_date,
+                edition=row.get("edition"),
                 status=row.get("status", "pending"),
                 started_at=started_dt,
                 completed_at=completed_dt,
@@ -362,6 +419,7 @@ class JsonFileDeliveryRepository(DeliveryRepository):
                 chunks_delivered=row.get("chunks_delivered", 0),
                 telegram_message_ids=tuple(row.get("telegram_message_ids", ())),
                 digest_hash=row.get("digest_hash"),
+                delivered_event_hashes=tuple(raw_hashes),
             )
         except Exception as exc:
             raise CorruptDeliveryStateError(
@@ -375,22 +433,29 @@ class JsonFileDeliveryRepository(DeliveryRepository):
         briefing_date: date,
         total_chunks: int,
         digest_hash: str | None = None,
+        edition: str | None = None,
+        event_hashes: list[str] | tuple[str, ...] | None = None,
     ) -> BriefingRecord:
+        clean_edition = edition.strip().lower() if edition else None
         data = self._load_data()
         record_id = str(uuid.uuid4())
         rec = BriefingRecord(
             id=record_id,
             briefing_date=briefing_date,
+            edition=clean_edition,
             status="processing",
             started_at=datetime.now(UTC),
             telegram_message_count=total_chunks,
             chunks_delivered=0,
             telegram_message_ids=(),
             digest_hash=digest_hash,
+            delivered_event_hashes=tuple(event_hashes or ()),
         )
-        data[briefing_date.isoformat()] = {
+        key = self._make_key(briefing_date, clean_edition)
+        data[key] = {
             "id": rec.id,
             "briefing_date": rec.briefing_date.isoformat(),
+            "edition": clean_edition,
             "status": rec.status,
             "started_at": rec.started_at.isoformat(),
             "completed_at": None,
@@ -398,6 +463,7 @@ class JsonFileDeliveryRepository(DeliveryRepository):
             "chunks_delivered": 0,
             "telegram_message_ids": [],
             "digest_hash": rec.digest_hash,
+            "delivered_event_hashes": list(rec.delivered_event_hashes),
             "error_message": None,
         }
         self._save_data(data)
@@ -405,9 +471,11 @@ class JsonFileDeliveryRepository(DeliveryRepository):
 
     def update_briefing(self, record: BriefingRecord) -> BriefingRecord:
         data = self._load_data()
-        data[record.briefing_date.isoformat()] = {
+        key = self._make_key(record.briefing_date, record.edition)
+        data[key] = {
             "id": record.id,
             "briefing_date": record.briefing_date.isoformat(),
+            "edition": record.edition,
             "status": record.status,
             "started_at": record.started_at.isoformat(),
             "completed_at": record.completed_at.isoformat() if record.completed_at else None,
@@ -415,10 +483,54 @@ class JsonFileDeliveryRepository(DeliveryRepository):
             "chunks_delivered": record.chunks_delivered,
             "telegram_message_ids": list(record.telegram_message_ids),
             "digest_hash": record.digest_hash,
+            "delivered_event_hashes": list(record.delivered_event_hashes),
             "error_message": record.error_message,
         }
         self._save_data(data)
         return record
+
+    def get_latest_briefing(self) -> BriefingRecord | None:
+        data = self._load_data()
+        records: list[BriefingRecord] = []
+        for row in data.values():
+            if not isinstance(row, dict) or row.get("status") != "sent":
+                continue
+            try:
+                b_date = (
+                    date.fromisoformat(row["briefing_date"])
+                    if row.get("briefing_date")
+                    else date.today()
+                )
+                started_dt = (
+                    datetime.fromisoformat(row["started_at"])
+                    if row.get("started_at")
+                    else datetime.now(UTC)
+                )
+                completed_dt = (
+                    datetime.fromisoformat(row["completed_at"]) if row.get("completed_at") else None
+                )
+                raw_hashes = row.get("delivered_event_hashes") or ()
+                records.append(
+                    BriefingRecord(
+                        id=str(row.get("id", uuid.uuid4())),
+                        briefing_date=b_date,
+                        edition=row.get("edition"),
+                        status="sent",
+                        started_at=started_dt,
+                        completed_at=completed_dt,
+                        telegram_message_count=row.get("telegram_message_count", 0),
+                        error_message=row.get("error_message"),
+                        chunks_delivered=row.get("chunks_delivered", 0),
+                        telegram_message_ids=tuple(row.get("telegram_message_ids", ())),
+                        digest_hash=row.get("digest_hash"),
+                        delivered_event_hashes=tuple(raw_hashes),
+                    )
+                )
+            except Exception:
+                continue
+        if not records:
+            return None
+        return max(records, key=lambda r: r.completed_at or r.started_at)
 
     def clear(self) -> None:
         self.release_lock()
@@ -432,7 +544,6 @@ class JsonFileDeliveryRepository(DeliveryRepository):
                 self.lock_path.unlink()
             except OSError:
                 pass
-
 
 
 class SupabaseDeliveryRepository(DeliveryRepository):
@@ -583,10 +694,14 @@ class SupabaseDeliveryRepository(DeliveryRepository):
         if self._chat_id:
             payload["telegram_chat_id"] = self._chat_id
 
-        res = self.client.table("briefings").upsert(
-            payload,
-            on_conflict="briefing_date",
-        ).execute()
+        res = (
+            self.client.table("briefings")
+            .upsert(
+                payload,
+                on_conflict="briefing_date",
+            )
+            .execute()
+        )
 
         row = res.data[0]
         return BriefingRecord(
@@ -627,10 +742,7 @@ class SupabaseDeliveryRepository(DeliveryRepository):
         url_to_id = dict(article_url_to_id or {})
         if not url_to_id:
             all_urls = [
-                a.canonical_url
-                for r in results
-                if hasattr(r, "event")
-                for a in r.event.articles
+                a.canonical_url for r in results if hasattr(r, "event") for a in r.event.articles
             ]
             if all_urls:
                 res = (
@@ -667,9 +779,7 @@ class SupabaseDeliveryRepository(DeliveryRepository):
                     why_it_matters = getattr(res_item, "significance", None)
                 else:
                     s = res_item.summary
-                    summary_text = getattr(
-                        s, "what_happened", str(s)
-                    )
+                    summary_text = getattr(s, "what_happened", str(s))
                     why_it_matters = getattr(
                         s,
                         "significance",
@@ -683,6 +793,12 @@ class SupabaseDeliveryRepository(DeliveryRepository):
                             key_details_data = dict(s.key_details)
                     if key_details_data and "actors" in key_details_data:
                         key_details_data["actors"] = list(key_details_data["actors"])
+                    if getattr(s, "claims", None):
+                        key_details_data = key_details_data or {}
+                        key_details_data["_evidence"] = {
+                            "claims": [claim.model_dump(mode="json") for claim in s.claims],
+                            "sources": [source.model_dump(mode="json") for source in s.sources],
+                        }
                     conf_qual = getattr(s, "confidence_qualification", None)
                     model_used_text = getattr(s, "model_used", None)
             elif hasattr(res_item, "headline"):
@@ -732,4 +848,3 @@ class SupabaseDeliveryRepository(DeliveryRepository):
             ).execute()
 
         return len(event_rows), len(evidence_rows)
-

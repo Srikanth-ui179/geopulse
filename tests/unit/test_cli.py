@@ -50,3 +50,35 @@ def test_unrecognized_argument_exits():
     with pytest.raises(SystemExit):
         main(["unknown-command"])
 
+
+def test_check_preflight_command_success(monkeypatch, capsys):
+    from geopulse.preflight import PreflightResult
+
+    def mock_preflight(*args, **kwargs):
+        return PreflightResult(success=True, details="All schema objects verified.")
+
+    monkeypatch.setattr("geopulse.cli.run_supabase_preflight", mock_preflight)
+    result = main(["check-preflight"])
+    captured = capsys.readouterr().out
+    assert result == 0
+    assert "Preflight check passed." in captured
+    assert "All schema objects verified." in captured
+
+
+def test_check_preflight_command_failure(monkeypatch, capsys):
+    from geopulse.preflight import PreflightResult
+
+    def mock_preflight(*args, **kwargs):
+        return PreflightResult(
+            success=False,
+            error_message="Missing function: upsert_events_with_articles",
+            details="Apply migration 006.",
+        )
+
+    monkeypatch.setattr("geopulse.cli.run_supabase_preflight", mock_preflight)
+    result = main(["check-preflight"])
+    captured = capsys.readouterr().out
+    assert result == 1
+    assert "Preflight check failed:" in captured
+    assert "Missing function: upsert_events_with_articles" in captured
+    assert "Apply migration 006." in captured

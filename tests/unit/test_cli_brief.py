@@ -29,16 +29,18 @@ def test_cli_brief_send_without_credentials_fails_gracefully(capsys, monkeypatch
 
 def test_cli_brief_send_with_mock_telegram_succeeds(capsys, tmp_path):
     test_state = str(tmp_path / "state.json")
-    exit_code = main([
-        "brief",
-        "--fixture",
-        "--mock-model",
-        "--send",
-        "--mock-telegram",
-        "--force",
-        "--state-file",
-        test_state,
-    ])
+    exit_code = main(
+        [
+            "brief",
+            "--fixture",
+            "--mock-model",
+            "--send",
+            "--mock-telegram",
+            "--force",
+            "--state-file",
+            test_state,
+        ]
+    )
     captured = capsys.readouterr().out
 
     assert exit_code == 0
@@ -57,6 +59,7 @@ def test_cli_brief_unknown_feed_filter_fails(capsys):
 
 def test_cli_brief_preview_never_instantiates_real_telegram_client(monkeypatch):
     """Confirm preview mode never creates a TelegramClient or attempts network calls."""
+
     def boom(*args, **kwargs):
         raise AssertionError("TelegramClient was instantiated during preview mode!")
 
@@ -67,18 +70,22 @@ def test_cli_brief_preview_never_instantiates_real_telegram_client(monkeypatch):
 
 def test_cli_brief_mock_telegram_never_instantiates_real_telegram_client(monkeypatch):
     """Confirm --mock-telegram never creates a real TelegramClient or makes network calls."""
+
     def boom(*args, **kwargs):
         raise AssertionError("TelegramClient was instantiated with --mock-telegram!")
 
     monkeypatch.setattr("geopulse.cli.TelegramClient", boom)
-    exit_code = main([
-        "brief",
-        "--fixture",
-        "--mock-model",
-        "--send",
-        "--mock-telegram",
-        "--force",
-    ])
+    exit_code = main(
+        [
+            "brief",
+            "--fixture",
+            "--mock-model",
+            "--send",
+            "--mock-telegram",
+            "--in-memory-state",
+            "--force",
+        ]
+    )
     assert exit_code == 0
 
 
@@ -151,6 +158,7 @@ def test_cli_test_telegram_offline_simulation_verifies_message_format(capsys, mo
         def send_message(self, text, parse_mode="HTML", **kwargs):
             sent_payloads.append(text)
             from geopulse.delivery.models import TelegramMessageResponse
+
             return TelegramMessageResponse(message_id=99999, chat_id=self.chat_id, date=1700000000)
 
     monkeypatch.setattr("geopulse.cli.TelegramClient", DummyClient)
@@ -171,4 +179,41 @@ def test_cli_test_telegram_offline_simulation_verifies_message_format(capsys, mo
     assert "FAKE_TOKEN_XYZ" not in msg
 
 
+def test_cli_brief_preview_with_max_events_cap(capsys):
+    """Confirm --max-events caps the output and prints omitted event count."""
+    exit_code = main(["brief", "--fixture", "--mock-model", "--preview", "--max-events", "2"])
+    captured = capsys.readouterr().out
 
+    assert exit_code == 0
+    assert "Events: 2 (Omitted: 4)" in captured
+    assert "Editorial Note: Briefing capped at top 2 events." in captured
+    assert "4 lower-priority event(s) omitted" in captured
+
+
+def test_cli_brief_invalid_max_events_fails(capsys):
+    """Confirm --max-events <= 0 is rejected with a validation error."""
+    exit_code = main(["brief", "--fixture", "--mock-model", "--preview", "--max-events", "0"])
+    captured = capsys.readouterr().out
+
+    assert exit_code == 1
+    assert "Error: --max-events must be greater than 0." in captured
+
+
+def test_cli_brief_preview_with_include_low_priority_flag(capsys):
+    """Confirm --include-low-priority flag is accepted and processed cleanly."""
+    exit_code = main(
+        [
+            "brief",
+            "--fixture",
+            "--mock-model",
+            "--preview",
+            "--max-events",
+            "5",
+            "--include-low-priority",
+        ]
+    )
+    captured = capsys.readouterr().out
+
+    assert exit_code == 0
+    assert "Geopulse Daily Briefing Preview" in captured
+    assert "PREVIEW COMPLETE" in captured

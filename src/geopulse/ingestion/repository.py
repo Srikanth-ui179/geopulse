@@ -78,11 +78,7 @@ class InMemoryArticleRepository(ArticleRepository):
         return len(articles), new_count
 
     def get_article_ids_by_urls(self, canonical_urls: list[str]) -> dict[str, str]:
-        return {
-            url: self._url_to_id[url]
-            for url in canonical_urls
-            if url in self._url_to_id
-        }
+        return {url: self._url_to_id[url] for url in canonical_urls if url in self._url_to_id}
 
     def get_articles_by_date_range(
         self,
@@ -238,9 +234,7 @@ class SupabaseArticleRepository(ArticleRepository):
             if isinstance(row.get("sources"), dict) and "name" in row["sources"]:
                 source_name = row["sources"]["name"]
             pub_dt = (
-                datetime.fromisoformat(row["published_at"])
-                if row.get("published_at")
-                else None
+                datetime.fromisoformat(row["published_at"]) if row.get("published_at") else None
             )
             fetch_dt = (
                 datetime.fromisoformat(row["fetched_at"])
@@ -263,4 +257,3 @@ class SupabaseArticleRepository(ArticleRepository):
                 )
             )
         return articles
-

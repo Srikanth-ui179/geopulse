@@ -38,6 +38,19 @@ class TelegramRateLimitError(TelegramDeliveryError):
         self.retry_after = retry_after
 
 
+class TelegramConflictError(TelegramDeliveryError):
+    """Raised when Telegram returns HTTP 409 Conflict.
+
+    Typically occurs when another polling instance or webhook is active.
+    """
+
+    def __init__(
+        self,
+        message: str = "Telegram polling conflict (HTTP 409): another instance is active.",
+    ) -> None:
+        super().__init__(message)
+
+
 class TelegramPermanentError(TelegramDeliveryError):
     """Raised on non-retryable 4xx client errors (e.g. 400 Bad Request, 401 Unauthorized).
 
@@ -66,4 +79,3 @@ class CorruptDeliveryStateError(TelegramDeliveryError):
     Fails closed to prevent accidental duplicate deliveries when prior delivery history
     cannot be reliably verified. Requires operator intervention to inspect, repair, or reset.
     """
-

@@ -42,8 +42,12 @@ class EventCluster(BaseModel):
 
     @property
     def source_count(self) -> int:
-        """Count of distinct news sources reporting on this event."""
-        return len({a.source_name for a in self.articles})
+        """Count distinct publishers linked to distinct articles in this event."""
+        publishers = {
+            a.source_name.strip().casefold() for a in self.articles if a.source_name.strip()
+        }
+        article_urls = {a.canonical_url for a in self.articles if a.canonical_url}
+        return min(len(publishers), len(article_urls))
 
     @property
     def article_count(self) -> int:
@@ -61,3 +65,5 @@ class ClusteringSummary(BaseModel):
     disputed_clusters: int
     uncertain_clusters: int
     clusters: tuple[EventCluster, ...] = Field(default_factory=tuple)
+    total_articles_evaluated: int = 0
+    articles_filtered_out: int = 0

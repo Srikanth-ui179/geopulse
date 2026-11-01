@@ -104,6 +104,7 @@ class PreflightResult:
     checked_tables: tuple[str, ...] = ()
     missing_tables: tuple[str, ...] = ()
     missing_columns: dict[str, list[str]] = field(default_factory=dict)
+    missing_functions: tuple[str, ...] = ()
     error_message: str | None = None
     details: str | None = None
 
@@ -132,6 +133,19 @@ def run_supabase_preflight(
                 error_message=(
                     "Supabase credentials are not configured. "
                     "Set SUPABASE_URL and SUPABASE_KEY in .env."
+                ),
+            )
+        if cfg.supabase_key_category == "publishable/anon":
+            return PreflightResult(
+                success=False,
+                error_message=(
+                    "SUPABASE_KEY is configured with a publishable/anon key. "
+                    "Persistent operations require a service_role secret key to bypass "
+                    "PostgreSQL Row-Level Security (RLS)."
+                ),
+                details=(
+                    "In the Supabase Dashboard, go to Project Settings > API > Project API keys "
+                    "and copy the 'service_role' (secret) key into SUPABASE_KEY in .env."
                 ),
             )
         try:
@@ -212,7 +226,55 @@ def run_supabase_preflight(
                         error_message=f"Preflight error querying columns in '{table_name}': {exc}",
                     )
 
-    if missing_tables or missing_columns:
+    # 2. Probe stored procedures for atomic clustering when in scope and client supports RPC
+    missing_functions: list[str] = []
+    if scope in ("cluster", "full") and hasattr(client, "rpc"):
+        try:
+            # Read-only probe: passing empty arrays returns immediately with 0 writes
+            client.rpc(
+                "upsert_events_with_articles",
+                {"p_events": [], "p_event_articles": []},
+            ).execute()
+        except Exception as rpc_exc:
+            r_err = str(rpc_exc)
+            is_missing_func = (
+                "PGRST202" in r_err
+                or "Could not find the function" in r_err
+                or (
+                    "upsert_events_with_articles" in r_err
+                    and ("could not find" in r_err.lower() or "does not exist" in r_err.lower())
+                )
+            )
+            if is_missing_func:
+                missing_functions.append("upsert_events_with_articles")
+            elif any(
+                t in r_err.lower() for t in ("401", "403", "permission denied", "unauthorized")
+            ):
+                return PreflightResult(
+                    success=False,
+                    checked_tables=tuple(checked_tables),
+                    missing_tables=tuple(missing_tables),
+                    missing_columns=missing_columns,
+                    missing_functions=tuple(missing_functions),
+                    error_message=(
+                        f"Permission denied executing RPC 'upsert_events_with_articles': {rpc_exc}"
+                    ),
+                    details=(
+                        "Ensure the configured Supabase API key has EXECUTE permission on "
+                        "function public.upsert_events_with_articles."
+                    ),
+                )
+            else:
+                return PreflightResult(
+                    success=False,
+                    checked_tables=tuple(checked_tables),
+                    missing_tables=tuple(missing_tables),
+                    missing_columns=missing_columns,
+                    missing_functions=tuple(missing_functions),
+                    error_message=f"Error probing RPC 'upsert_events_with_articles': {rpc_exc}",
+                )
+
+    if missing_tables or missing_columns or missing_functions:
         reasons: list[str] = []
         if missing_tables:
             reasons.append(f"Missing required table(s): {', '.join(missing_tables)}")
@@ -221,17 +283,28 @@ def run_supabase_preflight(
                 f"{tbl} ({', '.join(cols)})" for tbl, cols in missing_columns.items()
             )
             reasons.append(f"Missing required column(s): {col_desc}")
+        if missing_functions:
+            reasons.append(f"Missing required stored procedure(s): {', '.join(missing_functions)}")
+
+        if missing_functions and "upsert_events_with_articles" in missing_functions:
+            migration_details = (
+                "Pending database migration 006_atomic_event_persistence.sql must be reviewed "
+                "and applied to Supabase before persistent clustering can proceed."
+            )
+        else:
+            migration_details = (
+                "Pending database migrations (001-005) must be applied to Supabase "
+                "before persistent execution can proceed."
+            )
 
         return PreflightResult(
             success=False,
             checked_tables=tuple(checked_tables),
             missing_tables=tuple(missing_tables),
             missing_columns=missing_columns,
+            missing_functions=tuple(missing_functions),
             error_message="; ".join(reasons),
-            details=(
-                "Pending database migrations (001-005) must be applied to Supabase "
-                "before persistent execution can proceed."
-            ),
+            details=migration_details,
         )
 
     return PreflightResult(
