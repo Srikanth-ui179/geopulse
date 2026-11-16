@@ -3,7 +3,7 @@
 from datetime import UTC, datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from geopulse.clustering.models import EventCluster
 
@@ -53,6 +53,16 @@ class ClaimEvidenceReference(BaseModel):
     evidence_span: str
     verification_status: ClaimVerificationStatus = "pending"
     verification_reason: str | None = None
+    provenance: Literal["full_article", "rss_snippet", "unknown"] = "unknown"
+    nli_classification: Literal["entailment", "contradiction", "neutral"] | None = None
+    nli_confidence: float | None = None
+    article_id: str | None = None
+    article_revision_id: str | None = None
+    content_hash: str | None = None
+    retrieved_at: datetime | None = None
+    start_char: int | None = None
+    end_char: int | None = None
+    section_label: str | None = None
 
 
 class SummaryClaim(BaseModel):
@@ -68,6 +78,14 @@ class SummaryClaim(BaseModel):
     central: bool = False
     verification_status: ClaimVerificationStatus = "pending"
     verification_reason: str | None = None
+    provenance: Literal["full_article", "rss_snippet", "unknown"] = "unknown"
+    nli_classification: Literal["entailment", "contradiction", "neutral"] | None = None
+    nli_confidence: float | None = None
+    article_id: str | None = None
+    article_revision_id: str | None = None
+    corroboration_status: str | None = None
+    independent_chains_count: int = 1
+    corroboration_explanation: str | None = None
 
 
 class EventSummary(BaseModel):
@@ -97,6 +115,29 @@ class EventSummary(BaseModel):
     )
     model_used: str = Field(..., description="LLM model identifier used for generation")
     generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    corroboration_status: str = Field(
+        default="unassessed",
+        description="Phase 3 corroboration status",
+    )
+    independent_chains_count: int = Field(
+        default=0,
+        ge=0,
+        description="Demonstrably independent evidence chains",
+    )
+
+    @field_validator("corroboration_status", mode="before")
+    @classmethod
+    def _normalize_corroboration_status(cls, v: Any) -> str:
+        if v is None or str(v).strip().lower() in ("", "none", "null"):
+            return "unassessed"
+        return str(v).strip()
+
+    @field_validator("independent_chains_count", mode="before")
+    @classmethod
+    def _normalize_independent_chains(cls, v: Any) -> int:
+        if v is None:
+            return 0
+        return int(v)
 
 
 class SummarizationResult(BaseModel):
@@ -208,4 +249,15 @@ def reconstruct_event_summary(row: dict[str, Any]) -> EventSummary | None:
         claims=claims,
         model_used=model_used,
         generated_at=gen_at,
+        corroboration_status=(
+            str(row["corroboration_status"]).strip()
+            if row.get("corroboration_status")
+            and str(row["corroboration_status"]).strip().lower() not in ("none", "null", "")
+            else "unassessed"
+        ),
+        independent_chains_count=(
+            int(row["independent_chains_count"])
+            if row.get("independent_chains_count") is not None
+            else 0
+        ),
     )

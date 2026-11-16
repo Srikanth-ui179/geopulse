@@ -1,0 +1,155 @@
+{
+  "raf_fairford_plot": {
+    "day1_event": {
+      "title": "UK police probe sabotage plot targeting RAF Fairford air base",
+      "category": "security_incident",
+      "articles": [
+        {
+          "title": "UK counter-terrorism police probe activist sabotage plot targeting RAF Fairford",
+          "snippet": "Counter-terrorism officers are investigating a suspected activist sabotage plot to break into RAF Fairford and damage military aircraft.",
+          "url": "https://news.example.com/day1-fairford-plot",
+          "canonical_url": "https://news.example.com/day1-fairford-plot",
+          "source_name": "Gloucestershire Live"
+        }
+      ]
+    },
+    "day2_no_development": {
+      "title": "Security heightened at RAF Fairford amid ongoing sabotage investigation",
+      "category": "security_incident",
+      "articles": [
+        {
+          "title": "Security patrols heightened around perimeter of RAF Fairford amid ongoing probe",
+          "snippet": "Base security and local police maintain high alert around RAF Fairford as the investigation into the suspected activist plot continues with no new arrests.",
+          "url": "https://othernews.example.com/day2-fairford-security",
+          "canonical_url": "https://othernews.example.com/day2-fairford-security",
+          "source_name": "Wilts and Glos Standard"
+        }
+      ]
+    },
+    "day2_meaningful_development": {
+      "title": "Two men charged in court over RAF Fairford sabotage conspiracy",
+      "category": "security_incident",
+      "articles": [
+        {
+          "title": "Two activists appeared in court and charged with conspiracy to commit criminal damage at RAF Fairford",
+          "snippet": "Two suspects were formally charged in court today with conspiracy to damage aircraft at RAF Fairford following an extensive police operation.",
+          "url": "https://wire.example.com/day2-fairford-charged",
+          "canonical_url": "https://wire.example.com/day2-fairford-charged",
+          "source_name": "Press Association"
+        }
+      ]
+    },
+    "day3_distinct_event": {
+      "title": "US Air Force B-52 Stratofortress bombers deploy to RAF Fairford for NATO mission",
+      "category": "military_operations",
+      "articles": [
+        {
+          "title": "US B-52 bombers arrive at RAF Fairford for Bomber Task Force deployment",
+          "snippet": "A detachment of US Air Force B-52H bombers arrived at RAF Fairford in Gloucestershire to conduct long-planned allied integration flights across Europe.",
+          "url": "https://aviation.example.com/fairford-b52-deployment",
+          "canonical_url": "https://aviation.example.com/fairford-b52-deployment",
+          "source_name": "Key Aero"
+        }
+      ]
+    }
+  },
+  "us_army_espionage": {
+    "title": "US Army soldier arrested at Fort Campbell on espionage indictment",
+    "category": "intelligence_espionage",
+    "articles": [
+      {
+        "title": "US Army Sergeant Korbein Schultz arrested at Fort Campbell on charges of selling military secrets to China",
+        "snippet": "Department of Justice officials in Washington announced that US Army Sergeant Korbein Schultz was arrested at Fort Campbell, Kentucky on a federal indictment charging conspiracy to obtain and transmit national defense information to an individual in China.",
+        "url": "https://justice.example.gov/us-army-soldier-indicted-espionage",
+        "canonical_url": "https://justice.example.gov/us-army-soldier-indicted-espionage",
+        "source_name": "DOJ Office of Public Affairs"
+      }
+    ],
+    "expected_actor": "Sergeant Korbein Schultz",
+    "expected_location": "Fort Campbell, Kentucky",
+    "expected_category": "intelligence_espionage"
+  },
+  "technet_indo_pacific": {
+    "title": "TechNet Indo-Pacific highlights autonomous C4ISR systems and tactical communications",
+    "category": "military_technology",
+    "articles": [
+      {
+        "title": "Military and industry leaders convene at TechNet Indo-Pacific to discuss AI and resilient networks",
+        "snippet": "At TechNet Indo-Pacific in Honolulu, defence commanders and tech innovators evaluated tactical cloud computing, artificial intelligence in defense, and electronic countermeasures.",
+        "url": "https://signal.example.org/technet-indo-pacific-c4isr-ai",
+        "canonical_url": "https://signal.example.org/technet-indo-pacific-c4isr-ai",
+        "source_name": "SIGNAL Magazine"
+      }
+    ],
+    "expected_category": "military_technology"
+  },
+  "diplomacy_vs_conflict_priority": {
+    "active_conflict": {
+      "headline": "Deadly missile strike kills 8 in Dnipro residential sector; rescuers comb rubble",
+      "category": "armed_conflict",
+      "text": "Overnight missile strikes hit an apartment complex in Dnipro, killing eight civilians and injuring dozens as emergency crews comb the debris."
+    },
+    "rhetorical_diplomacy": {
+      "headline": "French foreign minister calls for resumption of peace talks during regional summit",
+      "category": "diplomacy",
+      "text": "The foreign minister urged regional diplomats to consider resuming dialogue and reiterated calls for a peaceful resolution."
+    },
+    "binding_accord": {
+      "headline": "Warring parties sign binding ceasefire agreement in Jeddah; prisoner exchange agreed",
+      "category": "diplomacy",
+      "text": "Delegations officially signed a binding ceasefire agreement entering into force immediately, concluding terms for a mutual prisoner exchange."
+    }
+  },
+  "corroboration_cases": {
+    "shared_wire": [
+      {
+        "title": "Ukraine launches drone barrage across western border regions",
+        "snippet": "MOSCOW (Reuters) - Ukrainian forces launched dozens of attack drones overnight targeting western regions, officials said.",
+        "url": "https://yahoo.example.com/reuters-syndicated-drone-strike",
+        "canonical_url": "https://reuters.example.com/ukraine-drone-strike",
+        "source_name": "Yahoo News"
+      },
+      {
+        "title": "Drones hit western border regions overnight",
+        "snippet": "(Reuters) - Dozens of drones were intercepted over western territories, according to local authorities.",
+        "url": "https://msn.example.com/reuters-republished-drones",
+        "canonical_url": "https://reuters.example.com/ukraine-drone-strike",
+        "source_name": "MSN News"
+      }
+    ],
+    "independent_reporting": [
+      {
+        "title": "BBC on the ground: Substation destroyed by guided glide bombs in Kharkiv",
+        "snippet": "Our correspondent on the ground inspected the crater and spoke to emergency engineers repairing the electrical grid following the precision strike.",
+        "url": "https://bbc.example.com/kharkiv-dispatch-substation",
+        "canonical_url": "https://bbc.example.com/kharkiv-dispatch-substation",
+        "source_name": "BBC News",
+        "author": "Quentin Sommerville"
+      },
+      {
+        "title": "Satellite imagery and local witness testimonies confirm destruction of regional power facility",
+        "snippet": "Commercial satellite imagery analyzed by our investigative team and interviews with local utility operators establish that three transformers were obliterated.",
+        "url": "https://nytimes.example.com/investigation-grid-damage",
+        "canonical_url": "https://nytimes.example.com/investigation-grid-damage",
+        "source_name": "The New York Times",
+        "author": "Christiaan Triebert"
+      }
+    ],
+    "single_source": [
+      {
+        "title": "Local municipal council reports unexplained power disruption",
+        "snippet": "According to a brief notice published on the municipal council portal, electrical technicians are investigating a sudden outage in the northern district.",
+        "url": "https://local-gazette.example.com/municipal-outage",
+        "canonical_url": "https://local-gazette.example.com/municipal-outage",
+        "source_name": "Local District Gazette"
+      }
+    ]
+  },
+  "allegations_attribution": {
+    "source_title": "US State Department accuses foreign intelligence of orchestrating European sabotage plot",
+    "source_snippet": "The State Department officially accused foreign intelligence operatives of coordinating arson and sabotage campaigns against critical infrastructure across Europe.",
+    "unattributed_headline": "Foreign Intelligence Orchestrated Arson and Sabotage Campaign Across Europe",
+    "attributed_headline": "State Department Accuses Foreign Intelligence of Coordinating European Sabotage"
+  }
+}
+

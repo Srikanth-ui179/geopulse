@@ -1,5 +1,6 @@
 """Geopulse RSS ingestion package."""
 
+from geopulse.ingestion.extractor import ArticleExtractor, ExtractedContent
 from geopulse.ingestion.feeds import DEFAULT_FEEDS, find_feed, get_default_feeds
 from geopulse.ingestion.fetcher import FeedFetchError, fetch_feed_data
 from geopulse.ingestion.models import (
@@ -21,6 +22,8 @@ from geopulse.ingestion.timestamps import parse_entry_timestamp
 
 __all__ = [
     "DEFAULT_FEEDS",
+    "ArticleExtractor",
+    "ExtractedContent",
     "ArticleRecord",
     "ArticleRepository",
     "FeedFetchError",

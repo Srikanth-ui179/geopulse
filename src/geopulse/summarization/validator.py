@@ -96,8 +96,37 @@ _METONYM_CAPITALS: frozenset[str] = frozenset(
         "ankara",
         "brussels",
         "tel aviv",
+        "rome",
+        "cairo",
+        "riyadh",
+        "taipei",
+        "seoul",
+        "new delhi",
+        "canberra",
+        "ottawa",
     }
 )
+
+_CAPITAL_TO_COUNTRY: dict[str, str] = {
+    "rome": "Italy",
+    "london": "United Kingdom",
+    "washington": "United States",
+    "paris": "France",
+    "berlin": "Germany",
+    "moscow": "Russia",
+    "beijing": "China",
+    "kyiv": "Ukraine",
+    "tehran": "Iran",
+    "tokyo": "Japan",
+    "ankara": "Turkey",
+    "cairo": "Egypt",
+    "riyadh": "Saudi Arabia",
+    "taipei": "Taiwan",
+    "seoul": "South Korea",
+    "new delhi": "India",
+    "canberra": "Australia",
+    "ottawa": "Canada",
+}
 
 _SPACE_MARITIME_CYBER_TERMS: re.Pattern[str] = re.compile(
     r"\b(space\s+wars?|space\s+operations?|military\s+satellites?|satellite\s+maneuvers?|"
@@ -264,6 +293,10 @@ _DANGLING_ENDINGS = re.compile(
     r"designated|operating|following|involving|including|"
     # Determiners and articles
     r"a|an|the|this|that|these|those|its|their|his|her|our|some|any|each|every|all|both|"
+    # Demonyms and nationality adjectives lacking nouns
+    r"iranian|russian|ukrainian|israeli|chinese|american|british|french|german|"
+    r"danish|swedish|norwegian|finnish|polish|saudi|turkish|yemeni|houthi|syrian|iraqi|lebanese|"
+    r"military|naval|air|joint|nuclear|strategic|conventional|tactical|bilateral|multilateral|"
     # Auxiliary and modal verbs
     r"is|are|was|were|be|been|being|have|has|had|do|does|did|will|would|shall|should|may|might|must|can|could"
     r")\s*$",
@@ -533,26 +566,462 @@ def deduplicate_actor_acronyms(actors: Sequence[str]) -> list[str]:
     return [a for a in actors if a not in to_remove]
 
 
+_NON_ACTOR_NOUNS: frozenset[str] = frozenset(
+    {
+        # Weather phenomena & natural disaster terms
+        "flood",
+        "floods",
+        "flooding",
+        "rain",
+        "heavy rain",
+        "rainfall",
+        "storm",
+        "storms",
+        "storming",
+        "hurricane",
+        "hurricanes",
+        "typhoon",
+        "typhoons",
+        "cyclone",
+        "cyclones",
+        "tornado",
+        "tornadoes",
+        "earthquake",
+        "earthquakes",
+        "tsunami",
+        "weather",
+        "snow",
+        "blizzard",
+        "drought",
+        "heatwave",
+        # Inanimate structures & physical objects
+        "building",
+        "buildings",
+        "house",
+        "houses",
+        "home",
+        "homes",
+        "infrastructure",
+        "tent",
+        "tents",
+        "shelter",
+        "shelters",
+        "rubble",
+        "ruins",
+        "facility",
+        "facilities",
+        "site",
+        "sites",
+        "street",
+        "streets",
+        "road",
+        "roads",
+        "bridge",
+        "bridges",
+        "pipeline",
+        "pipelines",
+        # Generic non-agent nouns & collectives
+        "debris",
+        "damage",
+        "damages",
+        "destruction",
+        "casualty",
+        "casualties",
+        "victim",
+        "victims",
+        "family",
+        "families",
+        "resident",
+        "residents",
+        "civilian",
+        "civilians",
+        "people",
+        "child",
+        "children",
+        # Weapons, ordnance, attack mechanisms, and incidents
+        "explosive",
+        "explosives",
+        "bomb",
+        "bombs",
+        "bombing",
+        "bombings",
+        "blast",
+        "blasts",
+        "explosion",
+        "explosions",
+        "attack",
+        "attacks",
+        "attacker",
+        "attackers",
+        "strike",
+        "strikes",
+        "munition",
+        "munitions",
+        "ammunition",
+        "device",
+        "devices",
+        "weapon",
+        "weapons",
+        "missile",
+        "missiles",
+        "drone",
+        "drones",
+        "rocket",
+        "rockets",
+        "firearm",
+        "firearms",
+        "gunfire",
+        "shelling",
+        "artillery",
+        "shrapnel",
+        "sabotage",
+        "arson",
+        "conspiracy",
+        "investigation",
+        "probe",
+        "inquest",
+        "inquests",
+    }
+)
+
+_BARE_BRANCH_NOUNS: frozenset[str] = frozenset(
+    {
+        "army",
+        "navy",
+        "air force",
+        "marines",
+        "military",
+        "armed forces",
+        "defense ministry",
+        "defence ministry",
+        "ministry of defense",
+        "ministry of defence",
+        "police",
+        "troops",
+        "forces",
+    }
+)
+
+_INVALID_LOCATION_TOKENS: frozenset[str] = frozenset(
+    {
+        "us",
+        "we",
+        "our",
+        "them",
+        "they",
+        "it",
+        "me",
+        "him",
+        "her",
+        "you",
+        "who",
+        "whom",
+        "where",
+        "what",
+        "how",
+        "why",
+        "here",
+        "there",
+        "someone",
+        "anyone",
+    }
+)
+
+
+_INVALID_ACTOR_TOKENS: frozenset[str] = frozenset(
+    {
+        "how",
+        "why",
+        "what",
+        "when",
+        "where",
+        "who",
+        "whom",
+        "whose",
+        "which",
+        "whether",
+        "if",
+        "because",
+        "although",
+        "despite",
+        "amid",
+        "after",
+        "before",
+        "during",
+        "under",
+        "over",
+        "about",
+        "into",
+        "through",
+        "with",
+        "within",
+        "without",
+        "against",
+        "toward",
+        "towards",
+        "helped",
+        "helps",
+        "helping",
+        "wins",
+        "won",
+        "winning",
+        "says",
+        "said",
+        "saying",
+        "tells",
+        "told",
+        "claims",
+        "claimed",
+        "claiming",
+        "reports",
+        "reported",
+        "reporting",
+        "announces",
+        "announced",
+        "announcing",
+        "shows",
+        "showed",
+        "shown",
+        "seen",
+        "sees",
+        "takes",
+        "took",
+        "taken",
+        "makes",
+        "made",
+        "making",
+        "the",
+        "a",
+        "an",
+        "this",
+        "that",
+        "these",
+        "those",
+        "there",
+        "here",
+        "it",
+        "its",
+        "they",
+        "their",
+        "them",
+        "he",
+        "him",
+        "his",
+        "she",
+        "her",
+        "we",
+        "our",
+        "us",
+        "you",
+        "your",
+    }
+)
+
+
+_POLLUTED_ACTOR_VERB_PAT = re.compile(
+    r"\b(?:decry|decries|endangering|approves?|approving|begins?|beginning|"
+    r"mandates?|mandating|expands?|expanding|tests?|testing|discusses?|discussing|"
+    r"warns?|warning|says?|saying|reports?|reporting|announces?|announcing|"
+    r"agrees?|agreeing|condemns?|condemning|must\s+invest|to\s+be\s+paid|"
+    r"spillover|commercial\s+ship\s+traffic)\b",
+    re.I,
+)
+
+
+def is_polluted_actor(raw: str, event_titles: Sequence[str] = ()) -> bool:
+    """Detect whether a candidate actor string contains headline fragments or verb clauses."""
+    clean = raw.strip()
+    clean_lower = clean.lower()
+    stripped_article = re.sub(r"^(?:the|an?)\s+", "", clean_lower).strip()
+    if (
+        clean_lower in _INVALID_ACTOR_TOKENS
+        or clean_lower in _NON_ACTOR_NOUNS
+        or clean_lower in _BARE_BRANCH_NOUNS
+        or stripped_article in _BARE_BRANCH_NOUNS
+    ):
+        return True
+    words = clean.split()
+    if words and words[-1].lower() in {
+        "a",
+        "an",
+        "the",
+        "and",
+        "or",
+        "in",
+        "on",
+        "at",
+        "to",
+        "for",
+        "of",
+        "from",
+        "with",
+        "by",
+        "amid",
+        "as",
+    }:
+        return True
+    if len(words) == 1 and (
+        clean_lower in _INVALID_ACTOR_TOKENS
+        or clean_lower in _NON_ACTOR_NOUNS
+        or clean_lower in _BARE_BRANCH_NOUNS
+    ):
+        return True
+    substantive_tokens = [
+        w
+        for w in re.findall(r"\b[A-Za-z0-9_-]+\b", clean_lower)
+        if w
+        not in {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "of",
+            "in",
+            "at",
+            "to",
+            "for",
+            "damaged",
+            "war-damaged",
+        }
+    ]
+    if substantive_tokens and all(
+        tok in _NON_ACTOR_NOUNS or tok in _BARE_BRANCH_NOUNS for tok in substantive_tokens
+    ):
+        return True
+    if len(words) > 5 or len(clean) > 40:
+        return True
+    if (
+        "<" in clean
+        or ">" in clean
+        or "placeholder" in clean_lower
+        or "specific named" in clean_lower
+    ):
+        return True
+    if _POLLUTED_ACTOR_VERB_PAT.search(clean):
+        return True
+    if clean_lower.startswith(("according to", "reported by", "the ministers of")):
+        return True
+    for title in event_titles:
+        t_words = set(re.findall(r"\b[A-Za-z]{3,}\b", title.lower()))
+        w_words = set(re.findall(r"\b[A-Za-z]{3,}\b", clean_lower))
+        if len(w_words) >= 3 and (len(w_words & t_words) / len(w_words)) >= 0.7:
+            return True
+    return False
+
+
 def sanitize_actors(
     actors: Sequence[str],
     source_names: Sequence[str] = (),
+    event_titles: Sequence[str] = (),
 ) -> list[str]:
-    """Deduplicate, clean, and normalize actor names, filtering publishers and placeholders."""
+    """Deduplicate and clean actor names, filtering headline fragments and verb phrases."""
     seen_lower: set[str] = set()
     sanitized: list[str] = []
+
+    # Pre-collect normalized actor candidate tokens to detect co-present parent countries
+    candidate_lowers: set[str] = set()
+    for raw_a in actors:
+        clean_a = html.unescape(str(raw_a)).strip().strip("\"'’‘.,;: ")
+        clean_a = re.sub(r"['’]s$", "", clean_a).strip().lower()
+        if clean_a:
+            candidate_lowers.add(clean_a)
+            if "," in clean_a or " and " in clean_a:
+                for sub_a in re.split(r",|\band\b", clean_a):
+                    sub_clean = sub_a.strip()
+                    if sub_clean:
+                        candidate_lowers.add(sub_clean)
+
+    def _is_redundant_capital(capital_cand: str) -> bool:
+        cap = capital_cand.lower().strip()
+        country = _CAPITAL_TO_COUNTRY.get(cap)
+        if not country:
+            return False
+        cntry_lower = country.lower()
+        active_pool = candidate_lowers | seen_lower
+        if cntry_lower in active_pool:
+            return True
+        syns = _DEMONYM_SYNONYMS.get(cntry_lower, ())
+        return any(syn in active_pool for syn in syns)
 
     for raw in actors:
         clean = html.unescape(str(raw)).strip()
         # Strip outer quotes or punctuation
-        clean = clean.strip("\"'“”‘’.,;: ")
-        # Strip possessive suffix if mistakenly parsed (e.g., "Turkey's" -> "Turkey")
+        clean = clean.strip("\"'’‘.,;: ")
+        # Strip possessive suffix if mistakenly parsed
         clean = re.sub(r"['’]s$", "", clean).strip()
 
         if not clean or len(clean) < 2:
             continue
+
+        # Split combined lists like 'Bulgaria, Romania and Turkey'
+        should_split = False
+        if "," in clean and len(clean.split()) <= 8:
+            should_split = True
+        elif " and " in clean and len(clean.split()) <= 6:
+            ends_with_org = any(
+                clean.endswith(suffix)
+                for suffix in (
+                    "Force",
+                    "Command",
+                    "Department",
+                    "Ministry",
+                    "Corps",
+                    "Service",
+                    "Agency",
+                    "Group",
+                    "Administration",
+                )
+            )
+            has_compound_title = any(
+                phrase in clean.lower()
+                for phrase in (
+                    "air and space",
+                    "research and development",
+                    "command and control",
+                )
+            )
+            if not ends_with_org and not has_compound_title:
+                should_split = True
+
+        if should_split:
+            parts = re.split(r",|\band\b", clean)
+            sub_actors = [p.strip().strip("\"'’‘.,;: ") for p in parts if p.strip()]
+            if sub_actors and all(not is_polluted_actor(p, event_titles) for p in sub_actors):
+                for sub in sub_actors:
+                    sub_lower = sub.lower()
+                    stripped_sub = re.sub(r"^(?:the|an?)\s+", "", sub_lower).strip()
+                    if (
+                        sub_lower in _BARE_BRANCH_NOUNS
+                        or stripped_sub in _BARE_BRANCH_NOUNS
+                        or _is_redundant_capital(sub)
+                    ):
+                        continue
+                    if (
+                        len(sub) >= 2
+                        and sub_lower not in seen_lower
+                        and not is_publisher_or_outlet(sub, source_names)
+                    ):
+                        seen_lower.add(sub_lower)
+                        sanitized.append(sub)
+                continue
+
+        if is_polluted_actor(clean, event_titles):
+            continue
+
         clean_lower = clean.lower()
+        stripped_clean = re.sub(r"^(?:the|an?)\s+", "", clean_lower).strip()
         if (
-            clean_lower
+            clean_lower in _BARE_BRANCH_NOUNS
+            or stripped_clean in _BARE_BRANCH_NOUNS
+            or _is_redundant_capital(clean)
+        ):
+            continue
+
+        if (
+            clean_lower in _INVALID_ACTOR_TOKENS
+            or clean_lower in _NON_ACTOR_NOUNS
+            or clean_lower
             in {
                 "unspecified",
                 "unspecified in reporting",
@@ -585,12 +1054,78 @@ def ground_event_location(
     Washington) represent seats of government/actors rather than event locations.
     If the location is unsupported by source text or a placeholder, it is cleanly omitted (None).
     """
-    if not raw_location:
+    if source_text is None:
+        src_parts = []
+        for art in event.articles:
+            src_parts.append(art.title)
+            if art.snippet:
+                src_parts.append(art.snippet)
+        source_text = " ".join(src_parts)
+
+    src_lower = source_text.lower()
+
+    def _fallback_source_location() -> str | None:
+        if not source_text:
+            return None
+        m_scene = re.search(
+            r"\b(?:meeting|met|held|conference)\s+(?:in|at)\s+([A-Z][a-z]+(?:,\s+[A-Z][a-z]+)?)\b",
+            source_text,
+        )
+        if m_scene:
+            return m_scene.group(1).strip()
+        m_fac = re.search(
+            r"\b(?:facility|plant|factory|base)\s+(?:in|at)\s+([A-Z][a-z]+(?:,\s+[A-Z][a-z]+)?)\b",
+            source_text,
+        )
+        if m_fac:
+            return m_fac.group(1).strip()
+        m_attacks = re.search(
+            r"\b(?:attacks?|strikes?|bombing|shelling)\s+(?:in|on|across|near|unnerve[s]?)\s+([A-Z][a-z]+(?:,\s+[A-Z][a-z]+)?)\b",
+            source_text,
+        )
+        if m_attacks:
+            cand = m_attacks.group(1).strip()
+            if cand.lower() not in _STOP_WORDS and cand.lower() not in _INVALID_LOCATION_TOKENS:
+                return cand
+        m_base = re.search(
+            r"\b((?:RAF|Fort|Camp|Air Base|Naval Base|Barracks|Garrison|Airfield)\s+"
+            r"[A-Z][a-z]+(?:,\s+[A-Z][a-z]+)?)\b",
+            source_text,
+        )
+        if m_base:
+            return m_base.group(1).strip()
+        m_inv = re.search(
+            r"\b(?:investigating(?:\s+\w+)?\s+locations?\s+in|investigation\s+in|arrested\s+in)\s+"
+            r"([A-Z][a-z]+(?:,\s+[A-Z][a-z]+)?)\b",
+            source_text,
+            re.I,
+        )
+        if m_inv:
+            cand = m_inv.group(1).strip()
+            if cand.lower() not in _STOP_WORDS and cand.lower() not in _INVALID_LOCATION_TOKENS:
+                return cand
+        m_county = re.search(
+            r"\b(?:near|outside|in)\s+([A-Z][a-z]+),\s*"
+            r"(?:England|Scotland|Wales|Northern Ireland|UK|United Kingdom)\b",
+            source_text,
+        )
+        if m_county:
+            cand = m_county.group(1).strip()
+            if cand.lower() not in _STOP_WORDS and cand.lower() not in _INVALID_LOCATION_TOKENS:
+                return cand
+        m_dateline = re.search(r"^\s*([A-Z][A-Za-z]+)\s*[—–-]", source_text)
+        if m_dateline:
+            cand = m_dateline.group(1).strip()
+            if cand.lower() not in _STOP_WORDS and cand.lower() not in _INVALID_LOCATION_TOKENS:
+                return cand
         return None
+
+    if not raw_location:
+        return _fallback_source_location()
 
     cleaned = html.unescape(str(raw_location)).strip().strip("\"'“”‘’.,;: ")
     if not cleaned:
-        return None
+        return _fallback_source_location()
 
     cleaned_lower = cleaned.lower()
     if _LEAKAGE_PATTERN.search(cleaned_lower) or cleaned_lower in {
@@ -603,17 +1138,64 @@ def ground_event_location(
         "reported conflict zone",
         "conflict zone",
     }:
-        return None
+        return _fallback_source_location()
 
-    if source_text is None:
-        src_parts = []
-        for art in event.articles:
-            src_parts.append(art.title)
-            if art.snippet:
-                src_parts.append(art.snippet)
-        source_text = " ".join(src_parts)
+    # Scene precedence: if raw location is a national capital (e.g. Washington, London),
+    # or foreign country, but the source text identifies an explicit military installation
+    # or investigation scene where the event occurred:
+    m_scene_base = re.search(
+        r"\b((?:RAF|Fort|Camp|Air Base|Naval Base|Barracks|Garrison|Airfield)\s+"
+        r"[A-Z][a-z]+(?:,\s+[A-Z][a-z]+)?)\b",
+        source_text,
+    )
+    m_scene_inv = re.search(
+        r"\b(?:investigating(?:\s+\w+)?\s+locations?\s+in|investigation\s+in|arrested\s+in)\s+"
+        r"([A-Z][a-z]+(?:,\s+[A-Z][a-z]+)?)\b",
+        source_text,
+        re.I,
+    )
+    if (m_scene_base or m_scene_inv) and cleaned_lower in {
+        "washington",
+        "london",
+        "moscow",
+        "beijing",
+        "us",
+        "uk",
+        "united states",
+        "united kingdom",
+        "germany",
+    }:
+        if m_scene_inv:
+            return m_scene_inv.group(1).strip()
+        if m_scene_base:
+            base_cand = m_scene_base.group(1).strip()
+            scene_pat = (
+                rf"\b(?:at|near|outside|stationed at|based at|entered|targeting|plot targeting)\s+"
+                rf"{re.escape(base_cand.lower())}\b|"
+                rf"\b{re.escape(base_cand.lower())}\s+(?:soldier|base|station|airfield|personnel|probe|plot)\b"
+            )
+            if re.search(scene_pat, src_lower):
+                return base_cand
 
-    src_lower = source_text.lower()
+    if cleaned_lower in _INVALID_LOCATION_TOKENS:
+        if cleaned_lower == "us":
+            has_country = bool(
+                re.search(
+                    r"\b(?:in|across|throughout|to)\s+(?:the\s+)?(?:US|U\.S\.|United States)\b",
+                    source_text,
+                )
+            )
+            is_pronoun_context = bool(
+                re.search(
+                    r"\b(?:bombing|bombed|targeting|targeted|with|against|told|warned|at)\s+us\b",
+                    source_text,
+                    re.I,
+                )
+            )
+            if not has_country or is_pronoun_context:
+                return _fallback_source_location()
+        else:
+            return _fallback_source_location()
 
     # 1. Distinguish space / orbital / high seas / cyber metonym capitals from event locations
     if cleaned_lower in _METONYM_CAPITALS:
@@ -631,20 +1213,21 @@ def ground_event_location(
             return None
 
     # 2. Check if the location (or its demonym/synonyms) appears in source text
+    matched_in_src = False
     if cleaned_lower in _DEMONYM_SYNONYMS:
         has_syn = any(
             syn in src_lower or bool(re.search(rf"\b{re.escape(syn)}\b", src_lower))
             for syn in _DEMONYM_SYNONYMS[cleaned_lower]
         )
         if has_syn:
-            return cleaned
+            matched_in_src = True
 
     loc_tokens = [
         tok.lower()
         for tok in re.findall(r"\b[a-zA-Z0-9_\u00C0-\u017F-]+\b", cleaned)
         if len(tok) >= 3 and tok.lower() not in _STOP_WORDS
     ]
-    if loc_tokens:
+    if loc_tokens and not matched_in_src:
         if len(loc_tokens) >= 2:
             phrase_clean = re.sub(r"\s+", " ", cleaned_lower)
             has_phrase = bool(re.search(rf"\b{re.escape(phrase_clean)}\b", src_lower))
@@ -658,6 +1241,7 @@ def ground_event_location(
             )
             if not (has_phrase or all_tokens):
                 return None
+            matched_in_src = True
         else:
             tok = loc_tokens[0]
             has_tok = tok in src_lower or (
@@ -665,6 +1249,7 @@ def ground_event_location(
             )
             if not has_tok:
                 return None
+            matched_in_src = True
 
     # 3. Reject location if it only appears in introductory boilerplate or list of challengers
     boilerplate_pat = re.compile(
@@ -678,7 +1263,114 @@ def ground_event_location(
         if not re.search(rf"\b{re.escape(cleaned_lower)}\b", outside_boilerplate):
             return None
 
+    # 4. Reject foreign conflict theater locations if the event is domestic politics/elections
+    is_domestic_fallout = bool(
+        re.search(
+            r"\b(midterms?|elections?|democrats?|republicans?|voters?|presidential race)\b",
+            source_text,
+            re.I,
+        )
+    )
+    if is_domestic_fallout and cleaned_lower in {"iran", "ukraine", "gaza", "russia", "yemen"}:
+        scene_in_country = re.search(
+            rf"\b(?:in|across|at)\s+(?:the\s+territory\s+of\s+)?{re.escape(cleaned_lower)}\b",
+            src_lower,
+        )
+        if not scene_in_country or re.search(rf"\b{re.escape(cleaned_lower)}\s+war\b", src_lower):
+            return None
+
+    # 5. Reject location if it only appears in illustrative examples in background surveys/reports
+    example_pat = re.compile(
+        r"\b(?:such as|for example|e\.g\.,?)\s+[^.]*\b" + re.escape(cleaned_lower) + r"\b",
+        re.I,
+    )
+    if example_pat.search(src_lower):
+        outside_examples = example_pat.sub("", src_lower)
+        if not re.search(rf"\b{re.escape(cleaned_lower)}\b", outside_examples):
+            return _fallback_source_location()
+
+    # 6. Explicit evidence requirement:
+    # A country/city must have explicit evidence connecting it as the setting of the event.
+    # If it only appears in a subordinate clause as an external counterpart (e.g. "with France"),
+    # and has no locative preposition ("in", "at", "across", "near"), no presence in title,
+    # and no presence in dateline: it lacks explicit evidence and must defer to fallback.
+    has_locative_prep = bool(
+        re.search(
+            rf"\b(?:in|at|near|outside|across|throughout)\s+(?:the\s+)?{re.escape(cleaned_lower)}\b",
+            src_lower,
+        )
+    )
+    event_title = getattr(event, "title", "") or ""
+    has_in_title = bool(re.search(rf"\b{re.escape(cleaned_lower)}\b", event_title.lower()))
+    has_in_dateline = bool(re.search(rf"^\s*{re.escape(cleaned_lower)}\s*[—–-]", src_lower))
+    if not (has_locative_prep or has_in_title or has_in_dateline):
+        counterpart_pat = re.compile(rf"\bwith\s+(?:the\s+)?{re.escape(cleaned_lower)}\b", re.I)
+        if counterpart_pat.search(src_lower):
+            return _fallback_source_location()
+
+    # 7. Recover canonical casing from source text if available, else preserve/capitalize
+    m_case = re.search(rf"\b{re.escape(cleaned)}\b", source_text, re.I)
+    if m_case:
+        return m_case.group(0)
+    if cleaned == cleaned.lower():
+        words = cleaned.split()
+        cap_words = [
+            w.capitalize()
+            if idx == 0 or w not in {"and", "or", "of", "in", "at", "the", "on"}
+            else w
+            for idx, w in enumerate(words)
+        ]
+        return " ".join(cap_words)
     return cleaned
+
+
+def clean_concise_action(raw: str | None) -> str | None:
+    """Normalize and validate event action into a concise verb phrase.
+
+    Rejects generic words, sentence-length narratives, and placeholders.
+    If a concise action cannot be reliably extracted, returns None.
+    """
+    if not raw:
+        return None
+    act_clean = sanitize_placeholder_text(str(raw)).strip().strip("\"'“”‘’.,;: ")
+    if not act_clean or _LEAKAGE_PATTERN.search(act_clean):
+        return None
+    if act_clean.lower() in {
+        "unspecified",
+        "unspecified in reporting",
+        "unknown",
+        "none",
+        "null",
+    }:
+        return None
+    _GENERIC_BUZZWORD_ACTIONS = re.compile(
+        r"^(?:(?:to\s+)?design,?\s+field,?\s+and\s+scale|"
+        r"(?:to\s+)?design\s+and\s+field|"
+        r"(?:to\s+)?field\s+and\s+scale|"
+        r"(?:to\s+)?research\s+and\s+develop|"
+        r"(?:to\s+)?study\s+and\s+evaluate|"
+        r"(?:to\s+)?monitor\s+the\s+situation)$",
+        re.I,
+    )
+    if _GENERIC_BUZZWORD_ACTIONS.match(act_clean):
+        return None
+    words = act_clean.split()
+    # If the action is an entire sentence or multi-clause paragraph
+    if len(words) > 10 or len(act_clean) > 80:
+        clause_split = re.split(
+            r"\s+(?:amid|following|after|because|which|as\s+part\s+of|due\s+to|in\s+order\s+to)\s+",
+            act_clean,
+            maxsplit=1,
+            flags=re.I,
+        )
+        trimmed = clause_split[0].strip().strip(".,;: ")
+        trimmed_words = trimmed.split()
+        if 2 <= len(trimmed_words) <= 8 and len(trimmed) <= 65:
+            return trimmed
+        return None
+    if len(words) == 1 and words[0].lower() in _INVALID_ACTOR_TOKENS:
+        return None
+    return act_clean
 
 
 # Words and titles commonly prefixed to person names
@@ -804,6 +1496,30 @@ _DEMONYM_SYNONYMS: dict[str, tuple[str, ...]] = {
     "ukraine": ("ukraine", "ukrainian"),
     "german": ("germany", "german"),
     "germany": ("germany", "german"),
+    "italian": ("italy", "italian"),
+    "italy": ("italy", "italian"),
+    "japanese": ("japan", "japanese"),
+    "japan": ("japan", "japanese"),
+    "chinese": ("china", "chinese"),
+    "china": ("china", "chinese"),
+    "iranian": ("iran", "iranian"),
+    "iran": ("iran", "iranian"),
+    "turkish": ("turkey", "turkish"),
+    "turkey": ("turkey", "turkish"),
+    "egyptian": ("egypt", "egyptian"),
+    "egypt": ("egypt", "egyptian"),
+    "saudi": ("saudi arabia", "saudi"),
+    "saudi arabia": ("saudi arabia", "saudi"),
+    "taiwanese": ("taiwan", "taiwanese"),
+    "taiwan": ("taiwan", "taiwanese"),
+    "korean": ("south korea", "korea", "korean"),
+    "south korea": ("south korea", "korea", "korean"),
+    "indian": ("india", "indian"),
+    "india": ("india", "indian"),
+    "australian": ("australia", "australian"),
+    "australia": ("australia", "australian"),
+    "canadian": ("canada", "canadian"),
+    "canada": ("canada", "canadian"),
     "raf": ("raf", "royal air force", "uk", "british", "britain"),
     "royal air force": ("raf", "royal air force", "uk", "british", "britain"),
     "allied": ("allies", "allied", "alliance", "coalition"),
@@ -1317,23 +2033,24 @@ def is_evidence_sufficient(event: EventCluster) -> tuple[bool, str | None]:
 
     for art in event.articles:
         t = (art.title or "").strip()
+        body = getattr(art, "body_text", None) if getattr(art, "is_full_text", False) else None
         s = (art.snippet or "").strip()
         if t:
             corpus_parts.append(t)
-        if s:
-            corpus_parts.append(s)
-            s_clean = re.sub(
+        content_text = body or s
+        if content_text:
+            corpus_parts.append(content_text)
+            c_clean = re.sub(
                 r"\b(?:no snippet available|read more|click here|subscribe|photo by|"
                 r"all rights reserved)\b",
                 "",
-                s,
+                content_text,
                 flags=re.I,
             ).strip()
-            # Check if snippet provides substantive tokens beyond repeating the title
             t_words = set(re.findall(r"\b[a-zA-Z0-9_\u00C0-\u017F-]+\b", t.lower()))
-            s_words = set(re.findall(r"\b[a-zA-Z0-9_\u00C0-\u017F-]+\b", s_clean.lower()))
-            new_words = s_words - t_words
-            if len(s_clean) >= 20 and len(new_words) >= 3:
+            c_words = set(re.findall(r"\b[a-zA-Z0-9_\u00C0-\u017F-]+\b", c_clean.lower()))
+            new_words = c_words - t_words
+            if len(c_clean) >= 20 and len(new_words) >= 3:
                 has_substantive_body = True
 
     combined_text = " ".join(corpus_parts).strip()

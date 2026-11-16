@@ -1,0 +1,292 @@
+[
+  {
+    "id": "bs_01",
+    "story": "black_sea",
+    "is_regression": true,
+    "category": "supported",
+    "premise": "Bulgarian, Romanian and Turkish defence ministers met in Sofia on October 28 to enhance maritime intelligence-sharing, domain awareness and early warning in the Black Sea.",
+    "hypothesis": "Defence ministers from Bulgaria, Romania and Turkey agreed in Sofia to enhance Black Sea maritime intelligence sharing and domain awareness.",
+    "expected_nli": "entailment",
+    "ground_truth_supported": true
+  },
+  {
+    "id": "bs_02",
+    "story": "black_sea",
+    "is_regression": true,
+    "category": "incorrect_location",
+    "premise": "Bulgarian, Romanian and Turkish defence ministers met in Sofia on October 28 to enhance maritime intelligence-sharing and domain awareness in the Black Sea.",
+    "hypothesis": "Ministers from Bulgaria, Romania and Turkey signed the Black Sea intelligence agreement in Constan\u021ba.",
+    "expected_nli": "contradiction",
+    "ground_truth_supported": false
+  },
+  {
+    "id": "bs_03",
+    "story": "black_sea",
+    "is_regression": true,
+    "category": "incorrect_quantity",
+    "premise": "According to data compiled by maritime security agency Ambrey and reported by the Financial Times, more than 570 merchant vessels were struck and at least 40 seafarers killed since early 2026.",
+    "hypothesis": "More than 800 merchant vessels were struck and at least 120 seafarers killed since early 2026.",
+    "expected_nli": "contradiction",
+    "ground_truth_supported": false
+  },
+  {
+    "id": "bs_04",
+    "story": "black_sea",
+    "is_regression": true,
+    "category": "related_unsupported",
+    "premise": "More than 570 merchant vessels were struck and at least 40 seafarers killed since early 2026, according to Ambrey.",
+    "hypothesis": "Bulgarian and Romanian defence ministers signed an agreement to establish joint naval mine countermeasures patrols.",
+    "expected_nli": "neutral",
+    "ground_truth_supported": false
+  },
+  {
+    "id": "bs_05",
+    "story": "black_sea",
+    "is_regression": true,
+    "category": "attribution_statement",
+    "premise": "According to data from Ambrey, reported by the Financial Times, at least 40 seafarers have been killed in Black Sea strikes.",
+    "hypothesis": "According to Financial Times / Ambrey, at least 40 seafarers were killed in Black Sea attacks.",
+    "expected_nli": "entailment",
+    "ground_truth_supported": true
+  },
+  {
+    "id": "pacom_01",
+    "story": "pacom",
+    "is_regression": true,
+    "category": "supported",
+    "premise": "The PACOM Mission Network enables secure multinational operational data-sharing, common mission planning tools, and a shared operational picture among regional allies.",
+    "hypothesis": "The PACOM Mission Network provides a shared operational picture and multinational operational data-sharing for participating forces.",
+    "expected_nli": "entailment",
+    "ground_truth_supported": true
+  },
+  {
+    "id": "pacom_02",
+    "story": "pacom",
+    "is_regression": true,
+    "category": "scope_overstatement",
+    "premise": "The PACOM Mission Network provides common data flows and coordinates allied mission planning, with partner forces using secure translation tools.",
+    "hypothesis": "PACOM deployed an automated machine translation network to direct live-fire tactical strikes.",
+    "expected_nli": "neutral",
+    "ground_truth_supported": false
+  },
+  {
+    "id": "pacom_03",
+    "story": "pacom",
+    "is_regression": true,
+    "category": "supported",
+    "premise": "Japanese partner forces integrated Maven Smart System data feeds into the PACOM network to coordinate regional air defense and maritime domain awareness.",
+    "hypothesis": "Japanese forces used Maven Smart System data feeds to coordinate regional air defense within the PACOM network.",
+    "expected_nli": "entailment",
+    "ground_truth_supported": true
+  },
+  {
+    "id": "patriot_01",
+    "story": "patriot",
+    "is_regression": true,
+    "category": "supported",
+    "premise": "The U.S. State Department approved a potential Foreign Military Sale of Patriot missile systems and related equipment to the Netherlands for an estimated $2.8 billion.",
+    "hypothesis": "The U.S. State Department approved a potential Foreign Military Sale of Patriot missiles to the Netherlands valued at approximately $2.8 billion.",
+    "expected_nli": "entailment",
+    "ground_truth_supported": true
+  },
+  {
+    "id": "patriot_02",
+    "story": "patriot",
+    "is_regression": true,
+    "category": "procurement_stage",
+    "premise": "The State Department approved a potential Foreign Military Sale to the Netherlands of Patriot missile systems for $2.8 billion, which was formally notified to Congress.",
+    "hypothesis": "The Netherlands purchased and took physical delivery of Patriot missile batteries from the United States.",
+    "expected_nli": "contradiction",
+    "ground_truth_supported": false
+  },
+  {
+    "id": "uk_01",
+    "story": "uk_offset",
+    "is_regression": true,
+    "category": "supported",
+    "premise": "Under the new UK defence procurement policy, foreign contractors winning defence contracts valued at \u00a350 million or more must commit to domestic industrial offsets.",
+    "hypothesis": "The UK defence industrial policy applies to contracts valued at \u00a350 million or more, requiring foreign suppliers to provide industrial benefits.",
+    "expected_nli": "entailment",
+    "ground_truth_supported": true
+  },
+  {
+    "id": "uk_02",
+    "story": "uk_offset",
+    "is_regression": true,
+    "category": "incorrect_quantity",
+    "premise": "The policy requires overseas defence suppliers to provide domestic economic offsets on procurement contracts exceeding \u00a350 million.",
+    "hypothesis": "Foreign contractors are required to invest \u00a350 million in UK factory construction.",
+    "expected_nli": "neutral",
+    "ground_truth_supported": false
+  },
+  {
+    "id": "hansa_01",
+    "story": "hansa",
+    "is_regression": true,
+    "category": "supported",
+    "premise": "Germany and Norway established the Hansa defence industrial partnership to coordinate Type 212CD submarine procurement, joint satellite surveillance, and missile production.",
+    "hypothesis": "The Germany-Norway Hansa pact coordinates submarine procurement, satellite surveillance, and missile production.",
+    "expected_nli": "entailment",
+    "ground_truth_supported": true
+  },
+  {
+    "id": "hansa_02",
+    "story": "hansa",
+    "is_regression": true,
+    "category": "scope_overstatement",
+    "premise": "Germany and Norway established the Hansa defence industrial partnership to coordinate Type 212CD submarine procurement, joint satellite surveillance, and missile production.",
+    "hypothesis": "The Hansa pact is an exclusive bilateral treaty focusing strictly on main battle tank manufacturing.",
+    "expected_nli": "contradiction",
+    "ground_truth_supported": false
+  },
+  {
+    "id": "baltic_01",
+    "story": "baltic_cables",
+    "is_regression": false,
+    "category": "supported",
+    "premise": "Finnish and Estonian maritime authorities launched a joint investigation after two subsea telecommunications cables severed in the Gulf of Finland.",
+    "hypothesis": "Finnish and Estonian authorities are investigating severed subsea telecommunications cables in the Gulf of Finland.",
+    "expected_nli": "entailment",
+    "ground_truth_supported": true
+  },
+  {
+    "id": "baltic_02",
+    "story": "baltic_cables",
+    "is_regression": false,
+    "category": "attribution_statement",
+    "premise": "Finnish police stated that anchors from a commercial cargo vessel were recovered near the fault site, while cautioning that intentional sabotage has not been confirmed.",
+    "hypothesis": "Finnish police confirmed that Russian special forces deliberately detonated explosives on the subsea cables.",
+    "expected_nli": "contradiction",
+    "ground_truth_supported": false
+  },
+  {
+    "id": "baltic_03",
+    "story": "baltic_cables",
+    "is_regression": false,
+    "category": "negation",
+    "premise": "The Estonian naval commander explicitly confirmed that NATO maritime forces have not closed the Gulf of Finland to civilian commercial shipping.",
+    "hypothesis": "NATO maritime forces closed the Gulf of Finland to civilian commercial traffic following the cable cuts.",
+    "expected_nli": "contradiction",
+    "ground_truth_supported": false
+  },
+  {
+    "id": "taiwan_01",
+    "story": "taiwan_transit",
+    "is_regression": false,
+    "category": "supported",
+    "premise": "A French Navy frigate and a Canadian patrol vessel conducted a routine freedom-of-navigation transit through the Taiwan Strait on Tuesday.",
+    "hypothesis": "French and Canadian naval vessels transited the Taiwan Strait on a freedom-of-navigation operation.",
+    "expected_nli": "entailment",
+    "ground_truth_supported": true
+  },
+  {
+    "id": "taiwan_02",
+    "story": "taiwan_transit",
+    "is_regression": false,
+    "category": "wrong_actor",
+    "premise": "A French Navy frigate and a Canadian patrol vessel transited the Taiwan Strait, monitored by PLA Eastern Theater Command naval vessels.",
+    "hypothesis": "A Royal Australian Navy frigate and a Japanese destroyer transited the Taiwan Strait.",
+    "expected_nli": "contradiction",
+    "ground_truth_supported": false
+  },
+  {
+    "id": "taiwan_03",
+    "story": "taiwan_transit",
+    "is_regression": false,
+    "category": "conflicting_report",
+    "premise": "Taiwan's Ministry of National Defense said the allied transit was conducted without incident in international waters, while Beijing's military spokesperson claimed Chinese forces escorted and warned the ships to leave Chinese territorial waters.",
+    "hypothesis": "Taiwan reported an uneventful transit in international waters, while Beijing claimed its military warned off the warships in territorial waters.",
+    "expected_nli": "entailment",
+    "ground_truth_supported": true
+  },
+  {
+    "id": "me_thaad_01",
+    "story": "me_air_defense",
+    "is_regression": false,
+    "category": "supported",
+    "premise": "The Pentagon ordered the deployment of a THAAD missile battery and approximately 100 U.S. service members to operate it to bolster air defense.",
+    "hypothesis": "The U.S. Pentagon deployed a THAAD battery along with around 100 military personnel to operate the system.",
+    "expected_nli": "entailment",
+    "ground_truth_supported": true
+  },
+  {
+    "id": "me_thaad_02",
+    "story": "me_air_defense",
+    "is_regression": false,
+    "category": "incorrect_quantity",
+    "premise": "The Pentagon ordered the deployment of a THAAD battery and approximately 100 U.S. service members to operate the system.",
+    "hypothesis": "The Pentagon deployed four THAAD batteries and 1,500 combat troops to the region.",
+    "expected_nli": "contradiction",
+    "ground_truth_supported": false
+  },
+  {
+    "id": "aukus_01",
+    "story": "aukus_pillar2",
+    "is_regression": false,
+    "category": "supported",
+    "premise": "Under AUKUS Pillar 2, defense scientists from Australia, the UK, and the U.S. completed joint test launches of a collaborative hypersonic glide vehicle testbed.",
+    "hypothesis": "AUKUS Pillar 2 partners conducted joint testing of a hypersonic testbed vehicle.",
+    "expected_nli": "entailment",
+    "ground_truth_supported": true
+  },
+  {
+    "id": "aukus_02",
+    "story": "aukus_pillar2",
+    "is_regression": false,
+    "category": "procurement_stage",
+    "premise": "Under AUKUS Pillar 2, scientists completed initial flight trials of an experimental hypersonic glide testbed, with operational fielding not expected until 2031.",
+    "hypothesis": "AUKUS allies deployed an operational hypersonic missile regiment to forward Pacific bases.",
+    "expected_nli": "contradiction",
+    "ground_truth_supported": false
+  },
+  {
+    "id": "red_sea_01",
+    "story": "red_sea",
+    "is_regression": false,
+    "category": "supported",
+    "premise": "Operation Aspides has provided close protection escorts for over 310 merchant ships passing through the southern Red Sea and Bab el-Mandeb strait.",
+    "hypothesis": "EU Operation Aspides escorted more than 300 commercial vessels through the southern Red Sea.",
+    "expected_nli": "entailment",
+    "ground_truth_supported": true
+  },
+  {
+    "id": "red_sea_02",
+    "story": "red_sea",
+    "is_regression": false,
+    "category": "wrong_actor",
+    "premise": "The European Union's Operation Aspides provided close protection escorts for commercial vessels transiting the Bab el-Mandeb strait.",
+    "hypothesis": "The Indian Ocean Rim Association conducted combat escorts in the Bab el-Mandeb strait under Operation Prosperity Guardian.",
+    "expected_nli": "contradiction",
+    "ground_truth_supported": false
+  },
+  {
+    "id": "darc_01",
+    "story": "darc_radar",
+    "is_regression": false,
+    "category": "supported",
+    "premise": "The U.S. Space Force awarded Northrop Grumman a $409 million contract to construct the second Deep Space Advanced Radar Capability (DARC) site at RAF Cawdor in Wales.",
+    "hypothesis": "Northrop Grumman won a $409 million contract to build a DARC radar site in Wales for deep-space tracking.",
+    "expected_nli": "entailment",
+    "ground_truth_supported": true
+  },
+  {
+    "id": "darc_02",
+    "story": "darc_radar",
+    "is_regression": false,
+    "category": "related_unsupported",
+    "premise": "The U.S. Space Force awarded a $409 million contract for the DARC ground-based radar facility in Wales to track objects in geosynchronous orbit.",
+    "hypothesis": "The UK Ministry of Defence launched two military communications satellites from a spaceport in Scotland.",
+    "expected_nli": "neutral",
+    "ground_truth_supported": false
+  },
+  {
+    "id": "darc_03",
+    "story": "darc_radar",
+    "is_regression": false,
+    "category": "incorrect_date",
+    "premise": "The DARC tracking facility in Wales is scheduled to reach initial operational capability by late 2026.",
+    "hypothesis": "The DARC radar facility achieved full operational capability in March 2022.",
+    "expected_nli": "contradiction",
+    "ground_truth_supported": false
+  }
+]

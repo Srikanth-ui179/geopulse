@@ -13,13 +13,21 @@ Coordinates the complete, audit-grade OSINT workflow across:
 """
 
 import hashlib
+import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 from geopulse.clustering import cluster_articles
 from geopulse.clustering.models import EventCluster
 from geopulse.clustering.repository import EventRepository, SupabaseEventRepository
+from geopulse.clustering.similarity import (
+    compute_event_semantic_signature,
+    has_meaningful_development,
+    is_same_underlying_event,
+    mark_event_as_update,
+)
 from geopulse.config import Settings, get_settings
 from geopulse.delivery.formatter import TelegramDigestFormatter
 from geopulse.delivery.models import DeliveryResult
@@ -158,6 +166,7 @@ class BriefingPipeline:
         lookback_hours: int | None = None,
         min_relevance_rank: float | None = None,
         include_low_priority: bool | None = None,
+        candidate_cap: int | None = None,
     ) -> PipelineResult:
         """Execute the end-to-end pipeline in strict, verifiable sequence."""
         target_date = briefing_date or date.today()
@@ -357,20 +366,117 @@ class BriefingPipeline:
                 )
 
         # Stage 5b: Consecutive Briefing Deduplication
-        # Suppress stories already briefed in the previous briefing unless force is requested
+        # Suppress stories already briefed in previous briefings unless force is requested
+        # Or publish as update if there is a meaningful development
         if deduplicate_consecutive and not force:
-            latest_briefing = deliv_repo.get_latest_briefing()
-            if latest_briefing and latest_briefing.delivered_event_hashes:
-                prev_hashes = set(latest_briefing.delivered_event_hashes)
+            try:
+                recent_briefings = deliv_repo.get_recent_briefings(limit=5)
+            except Exception:
+                recent_briefings = []
+            if not isinstance(recent_briefings, (list, tuple)):
+                try:
+                    latest = deliv_repo.get_latest_briefing()
+                    recent_briefings = (
+                        [latest] if latest and hasattr(latest, "delivered_event_hashes") else []
+                    )
+                except Exception:
+                    recent_briefings = []
+            prev_hashes: set[str] = set()
+            for b in recent_briefings:
+                b_date = getattr(b, "briefing_date", None)
+                if isinstance(b_date, (date, datetime)) and b_date >= target_date:
+                    continue
+                raw_hashes = getattr(b, "delivered_event_hashes", None)
+                if raw_hashes and isinstance(raw_hashes, (list, tuple, set)):
+                    prev_hashes.update(h for h in raw_hashes if isinstance(h, str))
+
+            # Fallback for sent briefings with empty delivered_event_hashes
+            # (e.g. historical records where hashes were not persisted)
+            empty_sent_dates = [
+                b.briefing_date
+                for b in recent_briefings
+                if getattr(b, "status", None) == "sent"
+                and not getattr(b, "delivered_event_hashes", None)
+                and isinstance(getattr(b, "briefing_date", None), (date, datetime))
+                and b.briefing_date < target_date
+            ]
+            if empty_sent_dates:
+                if ev_repo is not None:
+                    for d in empty_sent_dates:
+                        try:
+                            past_events = ev_repo.get_events_by_date(d)
+                            for pev in past_events:
+                                prev_hashes.add(compute_event_hash(pev))
+                                prev_hashes.add(compute_event_semantic_signature(pev))
+                        except Exception:
+                            pass
+                cache_dir = Path(".geopulse/article_cache")
+                for ev in events:
+                    ev_articles = getattr(ev, "articles", ())
+                    if not ev_articles:
+                        continue
+                    is_prior_cached = True
+                    for art in ev_articles:
+                        canonical = (
+                            getattr(art, "canonical_url", "") or getattr(art, "url", "")
+                        ).rstrip("/")
+                        if not canonical or not cache_dir.exists():
+                            is_prior_cached = False
+                            break
+                        uhash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+                        cpath = cache_dir / uhash[:2] / f"{uhash}.json"
+                        if not cpath.exists():
+                            is_prior_cached = False
+                            break
+                        art_dt = None
+                        try:
+                            cdata = json.loads(cpath.read_text(encoding="utf-8"))
+                            ext_str = cdata.get("extracted_at")
+                            if ext_str:
+                                art_dt = datetime.fromisoformat(ext_str)
+                        except Exception:
+                            pass
+                        if art_dt is None:
+                            art_pub = getattr(art, "published_at", None)
+                            if art_pub and hasattr(art_pub, "date"):
+                                art_dt = art_pub
+                        if art_dt is None:
+                            is_prior_cached = False
+                            break
+                        art_d = art_dt.date() if hasattr(art_dt, "date") else art_dt
+                        if art_d >= target_date or not any(
+                            art_d <= d for d in empty_sent_dates if d < target_date
+                        ):
+                            is_prior_cached = False
+                            break
+                    if is_prior_cached:
+                        prev_hashes.add(compute_event_hash(ev))
+                        prev_hashes.add(compute_event_semantic_signature(ev))
+            if prev_hashes:
                 filtered_events = []
                 for ev in events:
                     ev_hash = compute_event_hash(ev)
-                    if ev_hash in prev_hashes:
-                        logger.info(
-                            "Event '%s' (%s) was delivered in previous briefing. Skipping.",
-                            ev.title,
-                            ev_hash[:8],
-                        )
+                    ev_sig = compute_event_semantic_signature(ev)
+                    is_exact_match = ev_hash in prev_hashes
+                    is_sem_match = any(
+                        is_same_underlying_event(ev, prev_h) for prev_h in prev_hashes
+                    )
+
+                    if is_exact_match or is_sem_match:
+                        if has_meaningful_development(ev):
+                            logger.info(
+                                "Event '%s' represents a significant development of a "
+                                "previously reported event. Publishing as update.",
+                                ev.title,
+                            )
+                            filtered_events.append(mark_event_as_update(ev))
+                        else:
+                            logger.info(
+                                "Event '%s' (%s) was delivered in previous briefing with "
+                                "no meaningful development. Skipping.",
+                                ev.title,
+                                ev_hash[:8],
+                            )
                     else:
                         filtered_events.append(ev)
                 events = tuple(filtered_events)
@@ -379,7 +485,16 @@ class BriefingPipeline:
         effective_max_events = (
             max_events
             if max_events is not None
-            else (10 if edition in {"morning", "evening"} else None)
+            else (
+                6
+                if edition in {"daily", None}
+                else (10 if edition in {"morning", "evening"} else None)
+            )
+        )
+        effective_candidate_cap = (
+            candidate_cap
+            if candidate_cap is not None
+            else (8 if edition in {"daily", None} else getattr(self.settings, "candidate_cap", 12))
         )
         effective_min_relevance = (
             min_relevance_rank if min_relevance_rank is not None else self.min_relevance_rank
@@ -394,12 +509,13 @@ class BriefingPipeline:
                     summarization_results = self.summarizer.summarize_events(
                         events,
                         max_events=effective_max_events,
+                        candidate_cap=effective_candidate_cap,
                         min_relevance_rank=effective_min_relevance,
                         include_low_priority=effective_include_low,
                     )
                 except TypeError as type_err:
                     err_str = str(type_err)
-                    if "unexpected keyword argument" in err_str and "max_events" in err_str:
+                    if "unexpected keyword argument" in err_str:
                         summarization_results = self.summarizer.summarize_events(events)
                     else:
                         raise
@@ -479,7 +595,15 @@ class BriefingPipeline:
                 error_message="DeliveryService must be configured to execute delivery (send=True).",
             )
 
-        event_hashes = [compute_event_hash(r.event) for r in summarization_results]
+        event_hashes = []
+        for r in summarization_results:
+            if hasattr(r, "event") and r.event:
+                event_hashes.append(compute_event_hash(r.event))
+                event_hashes.append(compute_event_semantic_signature(r.event))
+        if not event_hashes and events:
+            for ev in events:
+                event_hashes.append(compute_event_hash(ev))
+                event_hashes.append(compute_event_semantic_signature(ev))
         try:
             deliv_res = self.delivery_service.deliver_digest(
                 digest_chunks=chunks,

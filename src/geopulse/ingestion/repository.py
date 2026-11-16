@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from geopulse.config import Settings
-from geopulse.ingestion.models import ArticleRecord, FeedSource
+from geopulse.ingestion.models import ArticleRecord, ArticleRevisionRecord, FeedSource
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +44,25 @@ class ArticleRepository(ABC):
         """Retrieve articles within a time window."""
         ...
 
+    @abstractmethod
+    def persist_article_revision(
+        self,
+        article_id: str,
+        revision: ArticleRevisionRecord,
+    ) -> bool:
+        """Persist a single immutable revision for an article."""
+        ...
+
+    @abstractmethod
+    def get_article_revisions(self, article_id: str) -> list[ArticleRevisionRecord]:
+        """Fetch all historical revisions for an article, ordered by revision_sequence."""
+        ...
+
+    @abstractmethod
+    def get_article_revision_by_id(self, revision_id: str) -> ArticleRevisionRecord | None:
+        """Fetch a specific revision by its unique revision UUID."""
+        ...
+
 
 class InMemoryArticleRepository(ArticleRepository):
     """In-memory article repository for offline testing and dry-run execution."""
@@ -53,6 +72,8 @@ class InMemoryArticleRepository(ArticleRepository):
         self._articles: dict[str, ArticleRecord] = {}
         self._url_to_id: dict[str, str] = {}
         self._source_articles: dict[str, list[str]] = {}
+        self._revisions: dict[str, list[ArticleRevisionRecord]] = {}
+        self._revision_by_id: dict[str, ArticleRevisionRecord] = {}
 
     def get_or_create_source(self, source: FeedSource) -> str:
         if source.feed_url not in self._sources:
@@ -94,11 +115,34 @@ class InMemoryArticleRepository(ArticleRepository):
                 results.append(a)
         return results
 
+    def persist_article_revision(
+        self,
+        article_id: str,
+        revision: ArticleRevisionRecord,
+    ) -> bool:
+        if revision.revision_id in self._revision_by_id:
+            return False
+        rev_list = self._revisions.setdefault(article_id, [])
+        if any(r.revision_sequence == revision.revision_sequence for r in rev_list):
+            return False
+        rev_list.append(revision)
+        self._revision_by_id[revision.revision_id] = revision
+        return True
+
+    def get_article_revisions(self, article_id: str) -> list[ArticleRevisionRecord]:
+        revs = self._revisions.get(article_id, [])
+        return sorted(revs, key=lambda r: r.revision_sequence)
+
+    def get_article_revision_by_id(self, revision_id: str) -> ArticleRevisionRecord | None:
+        return self._revision_by_id.get(revision_id)
+
     def clear(self) -> None:
         self._sources.clear()
         self._articles.clear()
         self._url_to_id.clear()
         self._source_articles.clear()
+        self._revisions.clear()
+        self._revision_by_id.clear()
 
 
 class SupabaseArticleRepository(ArticleRepository):
@@ -257,3 +301,148 @@ class SupabaseArticleRepository(ArticleRepository):
                 )
             )
         return articles
+
+    def persist_article_revision(
+        self,
+        article_id: str,
+        revision: ArticleRevisionRecord,
+    ) -> bool:
+        """Persist an article revision to Supabase."""
+        payload = {
+            "id": revision.revision_id,
+            "article_id": article_id,
+            "canonical_url": revision.canonical_url,
+            "content_hash": revision.content_hash,
+            "title": revision.title,
+            "publisher": revision.publisher,
+            "published_at": revision.published_at.isoformat() if revision.published_at else None,
+            "first_seen_at": revision.first_seen_at.isoformat(),
+            "retrieved_at": revision.retrieved_at.isoformat(),
+            "last_modified": revision.last_modified,
+            "etag": revision.etag,
+            "body_text": revision.body_text,
+            "extraction_status": revision.extraction_status,
+            "extraction_method": revision.extraction_method,
+            "revision_sequence": revision.revision_sequence,
+            "previous_revision_id": revision.previous_revision_id,
+            "revision_classification": revision.revision_classification,
+            "relevant_metadata": revision.relevant_metadata,
+        }
+        try:
+            self.client.table("article_revisions").insert(payload).execute()
+            self.client.table("articles").update(
+                {
+                    "current_revision_id": revision.revision_id,
+                    "revision_sequence": revision.revision_sequence,
+                }
+            ).eq("id", article_id).execute()
+            return True
+        except Exception as exc:
+            logger.warning("Failed to persist revision %s: %s", revision.revision_id, exc)
+            return False
+
+    def get_article_revisions(self, article_id: str) -> list[ArticleRevisionRecord]:
+        """Fetch all historical revisions for an article, ordered by sequence."""
+        try:
+            res = (
+                self.client.table("article_revisions")
+                .select("*")
+                .eq("article_id", article_id)
+                .order("revision_sequence")
+                .execute()
+            )
+            revisions: list[ArticleRevisionRecord] = []
+            for row in res.data or []:
+                revisions.append(
+                    ArticleRevisionRecord(
+                        revision_id=str(row["id"]),
+                        article_id=str(row["article_id"]),
+                        canonical_url=row["canonical_url"],
+                        content_hash=row["content_hash"],
+                        title=row["title"],
+                        publisher=row["publisher"],
+                        published_at=(
+                            datetime.fromisoformat(row["published_at"])
+                            if row.get("published_at")
+                            else None
+                        ),
+                        first_seen_at=(
+                            datetime.fromisoformat(row["first_seen_at"])
+                            if row.get("first_seen_at")
+                            else datetime.now(UTC)
+                        ),
+                        retrieved_at=(
+                            datetime.fromisoformat(row["retrieved_at"])
+                            if row.get("retrieved_at")
+                            else datetime.now(UTC)
+                        ),
+                        last_modified=row.get("last_modified"),
+                        etag=row.get("etag"),
+                        body_text=row.get("body_text"),
+                        extraction_status=row.get("extraction_status", "success"),
+                        extraction_method=row.get("extraction_method", "trafilatura"),
+                        revision_sequence=row.get("revision_sequence", 1),
+                        previous_revision_id=(
+                            str(row["previous_revision_id"])
+                            if row.get("previous_revision_id")
+                            else None
+                        ),
+                        revision_classification=row.get(
+                            "revision_classification", "initial_publication"
+                        ),
+                        relevant_metadata=row.get("relevant_metadata") or {},
+                    )
+                )
+            return revisions
+        except Exception as exc:
+            logger.warning("Failed to fetch revisions for article %s: %s", article_id, exc)
+            return []
+
+    def get_article_revision_by_id(self, revision_id: str) -> ArticleRevisionRecord | None:
+        """Fetch a specific revision by its unique UUID."""
+        try:
+            res = (
+                self.client.table("article_revisions")
+                .select("*")
+                .eq("id", revision_id)
+                .limit(1)
+                .execute()
+            )
+            if not res.data:
+                return None
+            row = res.data[0]
+            return ArticleRevisionRecord(
+                revision_id=str(row["id"]),
+                article_id=str(row["article_id"]),
+                canonical_url=row["canonical_url"],
+                content_hash=row["content_hash"],
+                title=row["title"],
+                publisher=row["publisher"],
+                published_at=(
+                    datetime.fromisoformat(row["published_at"]) if row.get("published_at") else None
+                ),
+                first_seen_at=(
+                    datetime.fromisoformat(row["first_seen_at"])
+                    if row.get("first_seen_at")
+                    else datetime.now(UTC)
+                ),
+                retrieved_at=(
+                    datetime.fromisoformat(row["retrieved_at"])
+                    if row.get("retrieved_at")
+                    else datetime.now(UTC)
+                ),
+                last_modified=row.get("last_modified"),
+                etag=row.get("etag"),
+                body_text=row.get("body_text"),
+                extraction_status=row.get("extraction_status", "success"),
+                extraction_method=row.get("extraction_method", "trafilatura"),
+                revision_sequence=row.get("revision_sequence", 1),
+                previous_revision_id=(
+                    str(row["previous_revision_id"]) if row.get("previous_revision_id") else None
+                ),
+                revision_classification=row.get("revision_classification", "initial_publication"),
+                relevant_metadata=row.get("relevant_metadata") or {},
+            )
+        except Exception as exc:
+            logger.warning("Failed to fetch revision %s: %s", revision_id, exc)
+            return None

@@ -3,9 +3,12 @@
 import json
 import logging
 import re
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -41,9 +44,9 @@ logger = logging.getLogger(__name__)
 # - Bounded corrective retries: 320 tokens (~38.6s max)
 # - Telegram QA bot answers: 256 tokens (~30.9s max)
 # Total worst-case generation for 2-stage event: 38.6s + 19.3s = 57.9s (safely inside 120s).
-STAGE_BUDGET_CLAIMS: int = 320
+STAGE_BUDGET_CLAIMS: int = 512
 STAGE_BUDGET_VERIFIER: int = 160
-STAGE_BUDGET_CORRECTION: int = 320
+STAGE_BUDGET_CORRECTION: int = 512
 STAGE_BUDGET_QA: int = 256
 
 DEFAULT_OLLAMA_OPTIONS: dict[str, Any] = {
@@ -107,7 +110,9 @@ class OllamaClient(BaseOllamaClient):
         model: str = "llama3.2:3b",
         connect_timeout: float = 5.0,
         read_timeout: float = 120.0,
-        max_retries: int = 2,
+        max_retries: int = 1,
+        request_timeout: float = 180.0,
+        max_abandoned_workers: int = 2,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -115,8 +120,13 @@ class OllamaClient(BaseOllamaClient):
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
         self.max_retries = max_retries
+        self.request_timeout = request_timeout
+        self.max_abandoned_workers = max_abandoned_workers
         self._transport = transport
         self._client: httpx.Client | None = None
+        self._executor: ThreadPoolExecutor | None = None
+        self._abandoned_workers_count: int = 0
+        self._abandoned_lock = threading.Lock()
         self.last_metrics: dict[str, Any] = {}
 
         self._timeout = httpx.Timeout(
@@ -125,6 +135,30 @@ class OllamaClient(BaseOllamaClient):
             write=10.0,
             pool=5.0,
         )
+
+    @property
+    def abandoned_workers_count(self) -> int:
+        """Return the number of currently active abandoned worker threads."""
+        with self._abandoned_lock:
+            return self._abandoned_workers_count
+
+    def _track_abandoned_worker(self, future: Any) -> None:
+        """Register a timed-out future to track and release when the background worker exits."""
+        with self._abandoned_lock:
+            if not future.done():
+                self._abandoned_workers_count += 1
+                decremented = False
+
+                def _release_abandoned(_fut: Any) -> None:
+                    nonlocal decremented
+                    with self._abandoned_lock:
+                        if not decremented:
+                            decremented = True
+                            self._abandoned_workers_count = max(
+                                0, self._abandoned_workers_count - 1
+                            )
+
+                future.add_done_callback(_release_abandoned)
 
     def _get_client(self) -> httpx.Client:
         if self._client is None or self._client.is_closed:
@@ -135,10 +169,44 @@ class OllamaClient(BaseOllamaClient):
             )
         return self._client
 
+    def _get_executor(self) -> ThreadPoolExecutor:
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="ollama-worker",
+            )
+        return self._executor
+
+    def _execute_post(
+        self,
+        client: httpx.Client,
+        url: str,
+        payload: dict[str, Any],
+        timeout: httpx.Timeout,
+    ) -> httpx.Response:
+        res = client.post(url, json=payload, timeout=timeout)
+        _ = res.content
+        return res
+
     def close(self) -> None:
-        if self._client is not None and not self._client.is_closed:
-            self._client.close()
-            self._client = None
+        """Safely release HTTP client and executor resources without blocking or masking errors."""
+        client = self._client
+        self._client = None
+        executor = self._executor
+        self._executor = None
+
+        if client is not None:
+            try:
+                if not client.is_closed:
+                    client.close()
+            except Exception as exc:
+                logger.debug("Error closing HTTP client during cleanup: %s", exc)
+
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception as exc:
+                logger.debug("Error shutting down worker executor during cleanup: %s", exc)
 
     @property
     def model(self) -> str:
@@ -146,7 +214,7 @@ class OllamaClient(BaseOllamaClient):
 
     def is_available(self) -> bool:
         try:
-            with httpx.Client(timeout=httpx.Timeout(connect=2.0, read=2.0)) as client:
+            with httpx.Client(timeout=httpx.Timeout(2.0)) as client:
                 res = client.get(f"{self.base_url}/api/tags")
                 return res.status_code == 200
         except (httpx.HTTPError, OSError):
@@ -172,12 +240,69 @@ class OllamaClient(BaseOllamaClient):
             payload["format"] = format_type
 
         url = f"{self.base_url}/api/generate"
+        overall_start = time.perf_counter()
+
+        with self._abandoned_lock:
+            if self._abandoned_workers_count >= self.max_abandoned_workers:
+                logger.error(
+                    "Ollama request rejected immediately: %d abandoned worker(s) "
+                    "active (limit: %d)",
+                    self._abandoned_workers_count,
+                    self.max_abandoned_workers,
+                )
+                raise OllamaTimeoutError(
+                    f"Ollama request rejected: {self._abandoned_workers_count} abandoned "
+                    f"worker(s) are still active (limit: {self.max_abandoned_workers}). "
+                    f"Wait for background Ollama inference to conclude before sending new requests."
+                )
+
+        deadline = overall_start + self.request_timeout
 
         for attempt in range(self.max_retries + 1):
+            now = time.perf_counter()
+            remaining_time = deadline - now
+            if remaining_time <= 0:
+                elapsed = time.perf_counter() - overall_start
+                logger.error(
+                    "Ollama request timed out after %.2fs (prompt_chars=%d, timeout=%.1fs)",
+                    elapsed,
+                    len(prompt),
+                    self.request_timeout,
+                )
+                self.close()
+                raise OllamaTimeoutError(
+                    f"Ollama request exceeded wall-clock deadline of {self.request_timeout:.1f}s "
+                    f"(elapsed={elapsed:.2f}s)."
+                )
+
             start_time = time.perf_counter()
             client = self._get_client()
+            attempt_timeout = httpx.Timeout(
+                connect=min(self.connect_timeout, remaining_time),
+                read=min(self.read_timeout, remaining_time),
+                write=min(10.0, remaining_time),
+                pool=min(5.0, remaining_time),
+            )
             try:
-                res = client.post(url, json=payload)
+                executor = self._get_executor()
+                future = executor.submit(self._execute_post, client, url, payload, attempt_timeout)
+                try:
+                    res = future.result(timeout=remaining_time)
+                except FuturesTimeoutError as exc:
+                    self._track_abandoned_worker(future)
+                    self.close()
+                    elapsed = time.perf_counter() - overall_start
+                    logger.error(
+                        "Ollama request timed out after %.2fs (prompt_chars=%d, timeout=%.1fs)",
+                        elapsed,
+                        len(prompt),
+                        self.request_timeout,
+                    )
+                    raise OllamaTimeoutError(
+                        f"Ollama request exceeded wall-clock deadline "
+                        f"of {self.request_timeout:.1f}s (elapsed={elapsed:.2f}s)."
+                    ) from exc
+
                 elapsed = time.perf_counter() - start_time
 
                 # Check for token repeat limit error in 500 responses
@@ -195,8 +320,22 @@ class OllamaClient(BaseOllamaClient):
                         payload["options"]["num_predict"] = min(
                             payload["options"].get("num_predict", 768), 512
                         )
-                        time.sleep(0.5)
-                        continue
+                        backoff = min(1.0, 0.5 * (attempt + 1))
+                        if deadline - time.perf_counter() > backoff:
+                            time.sleep(backoff)
+                            continue
+                        elapsed = time.perf_counter() - overall_start
+                        logger.error(
+                            "Ollama request timed out after %.2fs (prompt_chars=%d, timeout=%.1fs)",
+                            elapsed,
+                            len(prompt),
+                            self.request_timeout,
+                        )
+                        self.close()
+                        raise OllamaTimeoutError(
+                            f"Ollama request exceeded wall-clock deadline "
+                            f"of {self.request_timeout:.1f}s (elapsed={elapsed:.2f}s)."
+                        )
                     raise OllamaResponseError(
                         "Ollama prediction aborted: token repeat limit reached"
                     )
@@ -211,8 +350,22 @@ class OllamaClient(BaseOllamaClient):
                         elapsed,
                     )
                     if attempt < self.max_retries:
-                        time.sleep(0.5 * (attempt + 1))
-                        continue
+                        backoff = min(1.0, 0.5 * (attempt + 1))
+                        if deadline - time.perf_counter() > backoff:
+                            time.sleep(backoff)
+                            continue
+                        elapsed = time.perf_counter() - overall_start
+                        logger.error(
+                            "Ollama request timed out after %.2fs (prompt_chars=%d, timeout=%.1fs)",
+                            elapsed,
+                            len(prompt),
+                            self.request_timeout,
+                        )
+                        self.close()
+                        raise OllamaTimeoutError(
+                            f"Ollama request exceeded wall-clock deadline "
+                            f"of {self.request_timeout:.1f}s (elapsed={elapsed:.2f}s)."
+                        )
                     res.raise_for_status()
 
                 res.raise_for_status()
@@ -225,18 +378,31 @@ class OllamaClient(BaseOllamaClient):
                 prompt_tokens = data.get("prompt_eval_count")
                 eval_tokens = data.get("eval_count")
                 eval_duration_ns = data.get("eval_duration")
+                prompt_eval_duration_ns = data.get("prompt_eval_duration")
                 done_reason = data.get("done_reason")  # e.g., "stop" or "length"
 
                 tok_per_sec = 0.0
                 if eval_tokens and eval_duration_ns and eval_duration_ns > 0:
                     tok_per_sec = eval_tokens / (eval_duration_ns / 1e9)
 
+                prompt_tok_per_sec = 0.0
+                prompt_eval_sec = 0.0
+                if prompt_tokens and prompt_eval_duration_ns and prompt_eval_duration_ns > 0:
+                    prompt_eval_sec = prompt_eval_duration_ns / 1e9
+                    prompt_tok_per_sec = prompt_tokens / prompt_eval_sec
+
+                eval_sec = (eval_duration_ns / 1e9) if eval_duration_ns else 0.0
+
                 self.last_metrics = {
                     "model": self._model,
                     "prompt_tokens": prompt_tokens,
+                    "prompt_eval_seconds": round(prompt_eval_sec, 2),
+                    "prompt_eval_tokens_per_second": round(prompt_tok_per_sec, 2),
                     "eval_tokens": eval_tokens,
+                    "eval_seconds": round(eval_sec, 2),
                     "eval_tokens_per_second": round(tok_per_sec, 2),
                     "elapsed_seconds": round(elapsed, 2),
+                    "total_wall_clock_seconds": round(time.perf_counter() - overall_start, 2),
                     "done_reason": done_reason or "unknown",
                 }
 
@@ -250,12 +416,15 @@ class OllamaClient(BaseOllamaClient):
                     )
 
                 logger.info(
-                    "Ollama generate completed: model=%s, eval_tokens=%s (%.1f tok/s), "
-                    "prompt_tokens=%s, done_reason=%s, elapsed=%.2fs",
+                    "Ollama generate completed: model=%s, prompt=%s tokens (%.2fs, %.1f tok/s), "
+                    "eval=%s tokens (%.2fs, %.1f tok/s), done_reason=%s, elapsed=%.2fs",
                     self._model,
-                    eval_tokens,
-                    tok_per_sec,
                     prompt_tokens,
+                    prompt_eval_sec,
+                    prompt_tok_per_sec,
+                    eval_tokens,
+                    eval_sec,
+                    tok_per_sec,
                     done_reason or "unknown",
                     elapsed,
                 )
@@ -272,8 +441,21 @@ class OllamaClient(BaseOllamaClient):
                 )
                 self.close()
                 if attempt < self.max_retries:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
+                    backoff = min(1.0, 0.5 * (attempt + 1))
+                    if deadline - time.perf_counter() > backoff:
+                        time.sleep(backoff)
+                        continue
+                    elapsed = time.perf_counter() - overall_start
+                    logger.error(
+                        "Ollama request timed out after %.2fs (prompt_chars=%d, timeout=%.1fs)",
+                        elapsed,
+                        len(prompt),
+                        self.request_timeout,
+                    )
+                    raise OllamaTimeoutError(
+                        f"Ollama request exceeded wall-clock deadline "
+                        f"of {self.request_timeout:.1f}s (elapsed={elapsed:.2f}s)."
+                    ) from exc
                 msg = (
                     f"Ollama connection reset after {attempt + 1} "
                     f"attempts at {self.base_url}: {exc}"
@@ -291,25 +473,41 @@ class OllamaClient(BaseOllamaClient):
                 )
                 self.close()
                 if attempt < self.max_retries:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
+                    backoff = min(1.0, 0.5 * (attempt + 1))
+                    if deadline - time.perf_counter() > backoff:
+                        time.sleep(backoff)
+                        continue
+                    elapsed = time.perf_counter() - overall_start
+                    logger.error(
+                        "Ollama request timed out after %.2fs (prompt_chars=%d, timeout=%.1fs)",
+                        elapsed,
+                        len(prompt),
+                        self.request_timeout,
+                    )
+                    raise OllamaTimeoutError(
+                        f"Ollama request exceeded wall-clock deadline "
+                        f"of {self.request_timeout:.1f}s (elapsed={elapsed:.2f}s)."
+                    ) from exc
                 raise OllamaUnavailableError(
                     f"Ollama is unreachable at {self.base_url}. Ensure 'ollama serve' is running."
                 ) from exc
 
             except httpx.TimeoutException as exc:
-                elapsed = time.perf_counter() - start_time
+                elapsed = time.perf_counter() - overall_start
                 logger.error(
-                    "Ollama request timed out after %.2fs (prompt_chars=%d)",
+                    "Ollama request timed out after %.2fs (prompt_chars=%d, timeout=%.1fs)",
                     elapsed,
                     len(prompt),
+                    self.request_timeout,
                 )
                 self.close()
                 raise OllamaTimeoutError(
-                    f"Ollama request timed out after {self.read_timeout}s."
+                    f"Ollama request timed out after {self.request_timeout:.1f}s "
+                    f"(elapsed={elapsed:.2f}s)."
                 ) from exc
 
             except httpx.HTTPStatusError as exc:
+                self.close()
                 if exc.response.status_code == 404:
                     raise OllamaModelNotFoundError(
                         f"Model '{self._model}' not found in Ollama at {self.base_url}. "
@@ -320,6 +518,7 @@ class OllamaClient(BaseOllamaClient):
                 ) from exc
 
             except (json.JSONDecodeError, KeyError) as exc:
+                self.close()
                 raise OllamaResponseError(f"Invalid JSON returned by Ollama API: {exc}") from exc
 
 
@@ -338,6 +537,8 @@ class MockOllamaClient(BaseOllamaClient):
         transient_error_status: int | None = None,
         transient_error_count: int = 0,
         token_repeat_error_count: int = 0,
+        request_timeout: float = 180.0,
+        max_retries: int = 1,
         custom_generator: Callable[[str], str] | None = None,
     ) -> None:
         self._model = model
@@ -350,6 +551,8 @@ class MockOllamaClient(BaseOllamaClient):
         self.transient_error_status = transient_error_status
         self.transient_errors_remaining = transient_error_count
         self.token_repeat_errors_remaining = token_repeat_error_count
+        self.request_timeout = request_timeout
+        self.max_retries = max_retries
         self.custom_generator = custom_generator
         self.calls: list[dict[str, Any]] = []
         self.last_metrics: dict[str, Any] = {}
@@ -357,6 +560,14 @@ class MockOllamaClient(BaseOllamaClient):
     @property
     def model(self) -> str:
         return self._model
+
+    @property
+    def abandoned_workers_count(self) -> int:
+        return 0
+
+    def close(self) -> None:
+        """No-op resource release for mocked Ollama client."""
+        pass
 
     def is_available(self) -> bool:
         return not self.should_be_unavailable
@@ -791,7 +1002,9 @@ def _generate_mock_summary_json(prompt: str) -> str:
 
     # Satellite proximity operations / space wars
     if "satellite" in prompt_lower and (
-        "tails" in prompt_lower or "space wars" in prompt_lower or "ukraine-linked" in prompt_lower
+        bool(re.search(r"\btails\b", prompt_lower))
+        or "space wars" in prompt_lower
+        or "ukraine-linked" in prompt_lower
     ):
         return json.dumps(
             {
@@ -1349,6 +1562,8 @@ def resolve_summarization_clients(
                 base_url=cfg.ollama_base_url,
                 model=ollama_model,
                 read_timeout=getattr(cfg, "ollama_timeout", 120.0),
+                request_timeout=getattr(cfg, "ollama_request_timeout", 180.0),
+                max_retries=getattr(cfg, "ollama_max_retries", 1),
             ),
             None,
         )
@@ -1389,6 +1604,8 @@ def resolve_summarization_clients(
                     base_url=cfg.ollama_base_url,
                     model=ollama_model,
                     read_timeout=getattr(cfg, "ollama_timeout", 120.0),
+                    request_timeout=getattr(cfg, "ollama_request_timeout", 180.0),
+                    max_retries=getattr(cfg, "ollama_max_retries", 1),
                 ),
                 None,
             )
@@ -1405,6 +1622,8 @@ def resolve_summarization_clients(
             base_url=cfg.ollama_base_url,
             model=ollama_model,
             read_timeout=getattr(cfg, "ollama_timeout", 120.0),
+            request_timeout=getattr(cfg, "ollama_request_timeout", 180.0),
+            max_retries=getattr(cfg, "ollama_max_retries", 1),
         )
         return primary_client, fallback_client
 

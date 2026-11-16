@@ -103,6 +103,26 @@ def test_should_trigger_briefing_evening_at_8pm():
     assert runner.should_trigger_briefing(dt_2000, "evening") is True
 
 
+def test_should_trigger_briefing_daily_at_6pm():
+    """Verify daily consolidated briefing triggers at 6:00 PM (18:00) Kolkata and not before."""
+    settings = Settings(timezone="Asia/Kolkata")
+    kolkata_tz = settings.tz
+    deliv_repo = InMemoryDeliveryRepository()
+    runner = ServiceRunner(settings=settings, delivery_repo=deliv_repo, enable_bot=False)
+
+    # 17:59 PM (05:59 PM) -> Should NOT trigger
+    dt_1759 = datetime(2026, 10, 24, 17, 59, tzinfo=kolkata_tz)
+    assert runner.should_trigger_briefing(dt_1759, "daily") is False
+
+    # 18:00 PM (06:00 PM) -> Should trigger
+    dt_1800 = datetime(2026, 10, 24, 18, 0, tzinfo=kolkata_tz)
+    assert runner.should_trigger_briefing(dt_1800, "daily") is True
+
+    # 18:30 PM (06:30 PM) -> Should trigger if not yet sent
+    dt_1830 = datetime(2026, 10, 24, 18, 30, tzinfo=kolkata_tz)
+    assert runner.should_trigger_briefing(dt_1830, "daily") is True
+
+
 def test_restart_recovery_prevents_duplicate_scheduled_sends():
     """Verify that restarting the service does not resend an already-delivered briefing."""
     settings = Settings(timezone="Asia/Kolkata")

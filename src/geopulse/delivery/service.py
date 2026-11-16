@@ -413,7 +413,9 @@ class TelegramDeliveryService:
                 telegram_message_ids=tuple(delivered_message_ids),
                 error_message=error_msg,
                 digest_hash=digest_hash,
-                delivered_event_hashes=briefing_record.delivered_event_hashes,
+                delivered_event_hashes=(
+                    tuple(event_hashes) if event_hashes else briefing_record.delivered_event_hashes
+                ),
             )
             self.repository.update_briefing(updated_record)
 

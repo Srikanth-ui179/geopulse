@@ -1,6 +1,7 @@
 """Command line interface for Geopulse."""
 
 import argparse
+import hashlib
 import json
 import sys
 from collections.abc import Sequence
@@ -18,6 +19,13 @@ if hasattr(sys.stdout, "reconfigure"):
 from pydantic import ValidationError
 
 from geopulse.clustering import ClusteringSummary, SupabaseEventRepository, cluster_articles
+from geopulse.clustering.similarity import (
+    compute_event_hash,
+    compute_event_semantic_signature,
+    has_meaningful_development,
+    is_same_underlying_event,
+    mark_event_as_update,
+)
 from geopulse.config import Settings
 from geopulse.delivery import (
     InMemoryDeliveryRepository,
@@ -71,6 +79,304 @@ def handle_check_config() -> int:
         print(f"Supabase key category: {settings.supabase_key_category}")
     print(f"Telegram configured: {settings.is_telegram_configured}")
     return 0
+
+
+def handle_check_health() -> int:
+    """Execute comprehensive V1 health check across config, model, feeds, and storage."""
+    print("============================================================")
+    print("Geopulse V1 Operational Health Check")
+    print("============================================================")
+
+    # 1. Config validation
+    try:
+        settings = Settings()
+        print("[PASS] Configuration loaded successfully.")
+    except Exception as exc:
+        print(f"[FAIL] Configuration error: {exc}")
+        return 1
+
+    # 2. LLM / Model Availability Probe
+    print(f"Checking LLM Provider ({settings.llm_provider})...")
+    if settings.llm_provider == "ollama":
+        import urllib.request
+
+        ollama_url = f"{settings.ollama_base_url.rstrip('/')}/api/tags"
+        try:
+            req = urllib.request.Request(ollama_url, headers={"User-Agent": "Geopulse/1.0"})
+            with urllib.request.urlopen(req, timeout=2.5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                models = [m.get("name") for m in data.get("models", [])]
+                if settings.ollama_model in models or any(
+                    settings.ollama_model in m for m in models
+                ):
+                    print(f"[PASS] Ollama reachable. Model '{settings.ollama_model}' available.")
+                else:
+                    print(
+                        f"[WARN] Ollama reachable at {settings.ollama_base_url}, but model "
+                        f"'{settings.ollama_model}' not found in available models: {models[:5]}. "
+                        f"Run 'ollama pull {settings.ollama_model}'."
+                    )
+        except Exception as exc:
+            print(
+                f"[WARN] Ollama daemon not reachable at {settings.ollama_base_url} ({exc}). "
+                "For local inference, ensure daemon is running via 'ollama serve'."
+            )
+    elif settings.llm_provider == "gemini":
+        if settings.is_gemini_configured:
+            print(f"[PASS] Gemini API key configured for model '{settings.gemini_model}'.")
+        else:
+            print("[WARN] LLM_PROVIDER is 'gemini' but GEMINI_API_KEY is not set.")
+
+    # 3. Feed Reachability Probe
+    enabled_feeds = [f for f in DEFAULT_FEEDS if f.enabled]
+    print(f"Checking configured RSS Feeds ({len(enabled_feeds)} enabled)...")
+    import urllib.request
+
+    sample_feeds = enabled_feeds[:3]
+    reachable_count = 0
+    for feed in sample_feeds:
+        try:
+            req = urllib.request.Request(
+                feed.feed_url, headers={"User-Agent": "Geopulse/1.0 (HealthCheck)"}
+            )
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                if resp.status == 200:
+                    reachable_count += 1
+        except Exception:
+            pass
+    if reachable_count > 0:
+        print(
+            f"[PASS] RSS feeds probe: reachability verified "
+            f"({reachable_count}/{len(sample_feeds)} sampled feeds responded)."
+        )
+    else:
+        print(
+            "[WARN] RSS feeds probe: sampled feeds did not respond "
+            "(check internet/DNS connectivity)."
+        )
+
+    # 4. Storage & Pilot Queue Directory
+    dot_geo = Path(".geopulse")
+    try:
+        dot_geo.mkdir(parents=True, exist_ok=True)
+        test_file = dot_geo / ".health_test"
+        test_file.write_text("ok", encoding="utf-8")
+        test_file.unlink()
+        print("[PASS] Local runtime directory (.geopulse/) writable.")
+    except Exception as exc:
+        print(f"[FAIL] Local directory (.geopulse/) is not writable: {exc}")
+        return 1
+
+    # 5. Pilot Review Log & Queue Status
+    pilot_log = Path(".geopulse/pilot_review_log.json")
+    pilot_queue = Path(".geopulse/pilot_queue.json")
+    log_count = 0
+    if pilot_log.exists():
+        try:
+            log_count = len(json.loads(pilot_log.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    queue_count = 0
+    if pilot_queue.exists():
+        try:
+            queue_count = len(json.loads(pilot_queue.read_text(encoding="utf-8")))
+        except Exception:
+            pass
+    print(
+        f"[INFO] Supervisory Pilot Storage: {log_count} review decisions, "
+        f"{queue_count} events in queue."
+    )
+
+    # 6. Supabase Persistence Preflight (Optional)
+    if settings.is_supabase_configured:
+        res = run_supabase_preflight(settings=settings, scope="ingest")
+        if res.success:
+            print("[PASS] Supabase PostgreSQL connectivity and core schema verified.")
+        else:
+            print(f"[WARN] Supabase preflight warning: {res.error_message}")
+    else:
+        print("[INFO] Supabase not configured. Operating in safe in-memory / dry-run mode.")
+
+    print("============================================================")
+    print("Health check completed successfully.")
+    print("============================================================")
+    return 0
+
+
+def handle_pilot_queue(args: argparse.Namespace) -> int:
+    """Display events in the supervisory review queue with their operational status."""
+    from geopulse.pilot import OperatorSupervisedPilot
+
+    pilot = OperatorSupervisedPilot(
+        log_path=getattr(args, "log_file", None),
+        queue_path=getattr(args, "queue_file", None),
+    )
+    status_filter = getattr(args, "status", None)
+    items = pilot.get_queue(status_filter=status_filter)
+
+    print("============================================================")
+    print("Geopulse Operator Supervisory Review Queue")
+    print(f"Total Events Enqueued: {len(items)} (Filter: {status_filter or 'ALL'})")
+    print("============================================================")
+
+    if not items:
+        print(
+            "Queue is empty. Run 'geopulse brief --pilot-supervision --preview' to evaluate feeds."
+        )
+        return 0
+
+    for i, it in enumerate(items, 1):
+        status = it.get("operational_status", "UNKNOWN")
+        badge = it.get("proposed_badge", "[REPORT]")
+        title = it.get("event_title", "Untitled")
+        event_id = it.get("event_id", "")
+        src_cnt = it.get("source_count", 0)
+        art_cnt = it.get("article_count", 0)
+        fp = it.get("candidate_fingerprint", "")[:8]
+
+        status_tag = f"[{status}]"
+        print(f"#{i:02d} {status_tag:<26} {badge:<22} (FP:{fp})")
+        print(f"    Event ID: {event_id}")
+        print(f"    Title:    {title}")
+        print(f"    Sources:  {src_cnt} publishers, {art_cnt} articles")
+        if it.get("latest_decision"):
+            ld = it["latest_decision"]
+            ts = str(ld.get("timestamp", ""))[:19]
+            print(f"    Decision: {ld.get('action')} by {ld.get('analyst_id')} at {ts}")
+            print(f"    Rationale: {ld.get('analyst_rationale')}")
+        print("-" * 60)
+
+    print("Commands:")
+    print("  Inspect details: geopulse pilot inspect <event-id>")
+    print(
+        "  Record review:   geopulse pilot review <event-id> "
+        "--action approve --analyst-id <id> --reason <rationale>"
+    )
+    return 0
+
+
+def handle_pilot_inspect(args: argparse.Namespace) -> int:
+    """Display complete inspection dossier for an enqueued candidate event."""
+    from geopulse.pilot import OperatorSupervisedPilot
+
+    pilot = OperatorSupervisedPilot(
+        log_path=getattr(args, "log_file", None),
+        queue_path=getattr(args, "queue_file", None),
+    )
+    event_id = args.event_id.strip()
+    item = pilot.inspect_event(event_id)
+    if not item:
+        print(f"Error: Event '{event_id}' not found in pilot queue or review history.")
+        return 1
+
+    print("============================================================")
+    print(f"Geopulse Candidate Dossier: {item.get('event_title')}")
+    print(f"Event ID:      {item.get('event_id')}")
+    print(f"Category:      {item.get('category')}")
+    print(f"Fingerprint:   {item.get('candidate_fingerprint')}")
+    print(f"Status:        {item.get('operational_status')}")
+    prop_badge = item.get("proposed_badge")
+    prop_chains = item.get("proposed_chains")
+    gate_str = (
+        "MANDATORY OPERATOR APPROVAL" if item.get("requires_approval") else "AUTOMATED PASS-THROUGH"
+    )
+    print(f"Proposed:      {prop_badge} ({prop_chains} independent chains)")
+    print(f"Review Gate:   {gate_str}")
+    print("============================================================")
+
+    pkt = item.get("packet")
+    if pkt:
+        print("\n--- FACTUAL CLAIMS & EVIDENCE SPANS ---")
+        claims = pkt.get("claims_inspection", [])
+        if not claims:
+            print("  (No claim-level evidence extracted)")
+        for idx, c in enumerate(claims, 1):
+            central_tag = "[CENTRAL]" if c.get("central") else "[PERIPHERAL]"
+            print(f"\n  Claim #{idx} {central_tag} ({c.get('classification')}):")
+            print(f'    Text: "{c.get("claim_text")}"')
+            spans = c.get("evidence_spans", [])
+            urls = c.get("supporting_urls", [])
+            for sp, u in zip(spans, urls, strict=False):
+                print(f'    Evidence: "{sp}"')
+                print(f"    Source:   {u}")
+
+        print("\n--- ARTICLE REPORTING LINEAGE & DEPENDENCIES ---")
+        lineages = pkt.get("lineages_inspection", [])
+        for lin in lineages:
+            pub = lin.get("publisher")
+            l_class = lin.get("lineage_classification")
+            orig = lin.get("inferred_original_source")
+            url = lin.get("url")
+            author = lin.get("author") or "Staff"
+            print(f"  • {pub} ({author}): [{l_class.upper()}] -> Origin: {orig}")
+            print(f"    URL: {url}")
+
+    ld = item.get("latest_decision")
+    if ld:
+        print("\n--- LATEST ANALYST DECISION ---")
+        print(f"  Action:     {ld.get('action')}")
+        print(f"  Analyst:    {ld.get('analyst_id')}")
+        print(f"  Timestamp:  {ld.get('timestamp')}")
+        print(f"  Badge:      {ld.get('final_badge')} ({ld.get('final_chains')} chains)")
+        print(f"  Rationale:  {ld.get('analyst_rationale')}")
+
+    print("\n" + "=" * 60)
+    return 0
+
+
+def handle_pilot_review(args: argparse.Namespace) -> int:
+    """Record an analyst supervisory decision with mandatory rationale."""
+    from geopulse.pilot import OperatorSupervisedPilot
+
+    pilot = OperatorSupervisedPilot(
+        log_path=getattr(args, "log_file", None),
+        queue_path=getattr(args, "queue_file", None),
+    )
+    event_id = args.event_id.strip()
+    action = args.action.strip()
+    analyst_id = args.analyst_id.strip()
+    reason = args.reason.strip()
+
+    try:
+        approved_summary, log_entry = pilot.review_event(
+            event_id=event_id,
+            action=action,
+            analyst_id=analyst_id,
+            rationale=reason,
+        )
+    except KeyError as exc:
+        print(f"Error: {exc}")
+        return 1
+    except ValueError as exc:
+        print(f"Validation Error: {exc}")
+        return 1
+    except Exception as exc:
+        print(f"Error executing review: {exc}")
+        return 1
+
+    print("============================================================")
+    print("Geopulse Pilot Review Recorded Successfully")
+    print("============================================================")
+    print(f"Review ID:     {log_entry.review_id}")
+    print(f"Event ID:      {log_entry.event_id}")
+    print(f"Event Title:   {log_entry.event_title}")
+    print(f"Action Taken:  {log_entry.action}")
+    print(f"Final Badge:   {log_entry.final_badge}")
+    print(f"Final Status:  {log_entry.final_status} ({log_entry.final_chains} chains)")
+    print(f"Analyst ID:    {log_entry.analyst_id}")
+    print(f"Rationale:     {log_entry.analyst_rationale}")
+    print(f"Fingerprint:   {log_entry.candidate_fingerprint}")
+    print("============================================================")
+    print("Decision persisted. Run 'geopulse pilot preview' to view the updated briefing.")
+    return 0
+
+
+def handle_pilot_preview(args: argparse.Namespace) -> int:
+    """Convenience shortcut to preview briefing under pilot supervision."""
+    setattr(args, "pilot_supervision", True)
+    setattr(args, "preview", True)
+    setattr(args, "send", False)
+    return handle_brief(args)
 
 
 def handle_check_preflight(args: argparse.Namespace) -> int:
@@ -543,9 +849,19 @@ def handle_brief(args: argparse.Namespace) -> int:
         print("Error: Cannot specify both --preview and --send.")
         return 1
 
+    if getattr(args, "pilot_supervision", False) and getattr(args, "send", False):
+        print(
+            "Error: Pilot supervision mode is strictly dry-run. "
+            "Live Telegram delivery is prohibited."
+        )
+        return 1
+
     max_events = getattr(args, "max_events", None)
-    if max_events is None and getattr(args, "edition", None) in {"morning", "evening"}:
-        max_events = 10
+    if max_events is None:
+        if getattr(args, "edition", None) in {"daily", None}:
+            max_events = 6
+        elif getattr(args, "edition", None) in {"morning", "evening"}:
+            max_events = 10
     if max_events is not None and max_events <= 0:
         print("Error: --max-events must be greater than 0.")
         return 1
@@ -694,6 +1010,112 @@ def handle_brief(args: argparse.Namespace) -> int:
         print("No events identified for briefing.")
         return 0
 
+    # Stage 5b: Consecutive Briefing Deduplication
+    if not getattr(args, "force", False):
+        state_file = getattr(args, "state_file", None)
+        if getattr(args, "in_memory_state", False) or (
+            getattr(args, "fixture", False) and not state_file
+        ):
+            deliv_repo_dedup = InMemoryDeliveryRepository()
+        elif is_persist:
+            deliv_repo_dedup = SupabaseDeliveryRepository(settings=settings)
+        elif state_file:
+            deliv_repo_dedup = JsonFileDeliveryRepository(file_path=Path(state_file))
+        else:
+            deliv_repo_dedup = JsonFileDeliveryRepository(file_path=settings.delivery_state_file)
+
+        try:
+            recent_briefings = deliv_repo_dedup.get_recent_briefings(limit=5)
+        except Exception:
+            recent_briefings = []
+        if not isinstance(recent_briefings, (list, tuple)):
+            try:
+                latest = deliv_repo_dedup.get_latest_briefing()
+                recent_briefings = (
+                    [latest] if latest and hasattr(latest, "delivered_event_hashes") else []
+                )
+            except Exception:
+                recent_briefings = []
+
+        prev_hashes: set[str] = set()
+        for b in recent_briefings:
+            b_date = getattr(b, "briefing_date", None)
+            if isinstance(b_date, (date, datetime)) and b_date >= target_date:
+                continue
+            raw_hashes = getattr(b, "delivered_event_hashes", None)
+            if raw_hashes and isinstance(raw_hashes, (list, tuple, set)):
+                prev_hashes.update(h for h in raw_hashes if isinstance(h, str))
+
+        empty_sent_dates = [
+            b.briefing_date
+            for b in recent_briefings
+            if getattr(b, "status", None) == "sent"
+            and not getattr(b, "delivered_event_hashes", None)
+            and isinstance(getattr(b, "briefing_date", None), (date, datetime))
+            and b.briefing_date < target_date
+        ]
+        if empty_sent_dates and not getattr(args, "fixture", False):
+            cache_dir = Path(".geopulse/article_cache")
+            for ev in events:
+                ev_articles = getattr(ev, "articles", ())
+                if not ev_articles:
+                    continue
+                is_prior_cached = True
+                for art in ev_articles:
+                    canonical = (
+                        getattr(art, "canonical_url", "") or getattr(art, "url", "")
+                    ).rstrip("/")
+                    if not canonical or not cache_dir.exists():
+                        is_prior_cached = False
+                        break
+                    uhash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+                    cpath = cache_dir / uhash[:2] / f"{uhash}.json"
+                    if not cpath.exists():
+                        is_prior_cached = False
+                        break
+                    art_dt = None
+                    try:
+                        cdata = json.loads(cpath.read_text(encoding="utf-8"))
+                        ext_str = cdata.get("extracted_at")
+                        if ext_str:
+                            art_dt = datetime.fromisoformat(ext_str)
+                    except Exception:
+                        pass
+                    if art_dt is None:
+                        art_pub = getattr(art, "published_at", None)
+                        if art_pub and hasattr(art_pub, "date"):
+                            art_dt = art_pub
+                    if art_dt is None:
+                        is_prior_cached = False
+                        break
+                    art_d = art_dt.date() if hasattr(art_dt, "date") else art_dt
+                    if art_d >= target_date or not any(
+                        art_d <= d for d in empty_sent_dates if d < target_date
+                    ):
+                        is_prior_cached = False
+                        break
+                if is_prior_cached:
+                    prev_hashes.add(compute_event_hash(ev))
+                    prev_hashes.add(compute_event_semantic_signature(ev))
+
+        if prev_hashes:
+            filtered_events = []
+            for ev in events:
+                ev_hash = compute_event_hash(ev)
+                is_exact_match = ev_hash in prev_hashes
+                is_sem_match = any(is_same_underlying_event(ev, prev_h) for prev_h in prev_hashes)
+                if is_exact_match or is_sem_match:
+                    if has_meaningful_development(ev):
+                        filtered_events.append(mark_event_as_update(ev))
+                else:
+                    filtered_events.append(ev)
+            events = tuple(filtered_events)
+            if not events:
+                print(
+                    "All candidate events were previously briefed. No new developments to report."
+                )
+                return 0
+
     if is_persist and events:
         try:
             ev_repo = SupabaseEventRepository(settings=settings)
@@ -710,6 +1132,12 @@ def handle_brief(args: argparse.Namespace) -> int:
     include_low_priority = getattr(args, "include_low_priority", False) or getattr(
         settings, "include_low_priority", False
     )
+    candidate_cap = (
+        getattr(args, "candidate_cap", None)
+        or (8 if getattr(args, "edition", None) in {"daily", None} else None)
+        or getattr(settings, "candidate_cap", None)
+        or 12
+    )
 
     summarizer = EventSummarizer(
         client=summarization_client,
@@ -719,9 +1147,21 @@ def handle_brief(args: argparse.Namespace) -> int:
     results = summarizer.summarize_events(
         events,
         max_events=max_events,
+        candidate_cap=candidate_cap,
         min_relevance_rank=min_relevance_rank,
         include_low_priority=include_low_priority,
     )
+
+    if hasattr(summarizer, "last_candidate_metrics") and summarizer.last_candidate_metrics:
+        m = summarizer.last_candidate_metrics
+        p_ex = m.get("priority_excluded", 0)
+        def_c = m.get("deferred_candidates", 0)
+        print(
+            f"Candidate Selection: {m['total_clusters']} total clusters, "
+            f"{m['eligible_candidates']} eligible ({p_ex} excluded by rank), "
+            f"{m['selected_candidates']} selected (cap: {m['candidate_cap']}), "
+            f"{def_c} deferred"
+        )
 
     if is_persist and events and "ev_repo" in locals():
         try:
@@ -730,10 +1170,27 @@ def handle_brief(args: argparse.Namespace) -> int:
             print(f"Error: Failed to update event summaries: {exc}")
             return 1
 
+    if getattr(args, "pilot_supervision", False):
+        from geopulse.pilot import OperatorSupervisedPilot
+
+        pilot = OperatorSupervisedPilot()
+        results, pending_packets = pilot.supervise_summaries(results, hold_unapproved=True)
+        if pending_packets:
+            print(
+                f"\n[PILOT SUPERVISION ALERT]: Intercepted {len(pending_packets)} unapproved "
+                "[CORROBORATED] event(s)."
+            )
+            for pkt in pending_packets:
+                print(
+                    f"  - Held in review queue: '{pkt.event_title}' "
+                    f"(Claims: {len(pkt.claims_inspection)}, Sources: {pkt.source_count})"
+                )
+            print("These events are held from the digest until approved by a human analyst.\n")
+
     # Format Telegram digest
     formatter = TelegramDigestFormatter()
     today_date = date.today()
-    edition = getattr(args, "edition", None)
+    edition = getattr(args, "edition", None) or "daily"
     chunks = formatter.format_digest(
         results=results,
         briefing_date=today_date,
@@ -746,7 +1203,11 @@ def handle_brief(args: argparse.Namespace) -> int:
     # 1. Preview / Dry-run Mode (default unless --send is passed)
     if not is_send:
         print("\n" + "=" * 60)
-        edition_label = f" ({edition.capitalize()} Edition)" if edition else ""
+        edition_label = (
+            f" ({edition.capitalize()} Edition)"
+            if edition and edition.lower() in {"morning", "evening"}
+            else ""
+        )
         print(f"Geopulse Daily Briefing Preview{edition_label} [Telegram HTML Format]")
         success_results = [r for r in results if r.status == "success" and r.summary is not None]
         selected_events = formatter.select_digest_events(
@@ -756,19 +1217,16 @@ def handle_brief(args: argparse.Namespace) -> int:
             include_low_priority=include_low_priority,
         )
         events_included = len(selected_events)
-        candidate_count = sum(
-            1
-            for r in results
-            if (
-                (r.status == "success" and r.summary is not None)
-                or (r.summary is not None and getattr(r.summary, "model_used", "") == "omitted")
-            )
-            and r.status != "quarantined"
+        total_clusters_count = len(results)
+        quarantined_count = sum(
+            1 for r in results if r.status in {"quarantined", "insufficient_evidence", "failed"}
         )
-        omitted_count = max(0, candidate_count - events_included) if events_included > 0 else 0
+        omitted_count = max(0, total_clusters_count - events_included - quarantined_count)
         print(
             f"Date: {today_date} | Chunks: {len(chunks)} | "
-            f"Events: {events_included} (Omitted: {omitted_count})"
+            f"Events: {events_included} (Omitted: {omitted_count}) | "
+            f"Published: {events_included} | Quarantined/Rejected: {quarantined_count} | "
+            f"Omitted: {omitted_count} (Total clusters: {total_clusters_count})"
         )
         print("=" * 60)
         for idx, chunk in enumerate(chunks, start=1):
@@ -817,12 +1275,23 @@ def handle_brief(args: argparse.Namespace) -> int:
     )
 
     print(f"\nDelivering briefing to Telegram ({len(chunks)} chunk(s))...")
+    brief_hashes = []
+    for r in results:
+        if hasattr(r, "event") and r.event:
+            brief_hashes.append(compute_event_hash(r.event))
+            brief_hashes.append(compute_event_semantic_signature(r.event))
+    if not brief_hashes and events:
+        for ev in events:
+            brief_hashes.append(compute_event_hash(ev))
+            brief_hashes.append(compute_event_semantic_signature(ev))
+
     try:
         deliv_res = delivery_service.deliver_digest(
             digest_chunks=chunks,
             briefing_date=today_date,
             force=getattr(args, "force", False),
             edition=edition,
+            event_hashes=brief_hashes,
         )
     except Exception as exc:
         print(f"Error: Delivery service failed: {exc}")
@@ -940,8 +1409,9 @@ def handle_service(args: argparse.Namespace) -> int:
         print("=" * 60)
         print("  Status:               Operational")
         print(f"  Configured Timezone:  {settings.timezone}")
-        print(f"  Morning Briefing:     08:00 AM {settings.timezone}")
-        print(f"  Evening Briefing:     08:00 PM {settings.timezone}")
+        print(f"  Daily Briefing:       06:00 PM (18:00) {settings.timezone}")
+        print(f"  Morning Briefing:     08:00 AM {settings.timezone} (Legacy)")
+        print(f"  Evening Briefing:     08:00 PM {settings.timezone} (Legacy)")
         print(f"  LLM Provider:         {settings.llm_provider}")
         if settings.llm_provider in ("auto", "gemini"):
             print(f"  Gemini Model:         {settings.gemini_model}")
@@ -1107,7 +1577,7 @@ def main(argv: list[str] | None = None) -> int:
         "--limit",
         type=int,
         default=None,
-        help="Maximum articles to ingest per feed (default: 10 or configured FEED_LIMIT).",
+        help="Maximum articles to ingest per feed (default: 25 or configured FEED_LIMIT).",
     )
     ingest_parser.add_argument(
         "--feed",
@@ -1136,7 +1606,7 @@ def main(argv: list[str] | None = None) -> int:
         "--limit",
         type=int,
         default=None,
-        help="Maximum articles to ingest per feed (default: 10 or configured FEED_LIMIT).",
+        help="Maximum articles to ingest per feed (default: 25 or configured FEED_LIMIT).",
     )
     cluster_parser.add_argument(
         "--feed",
@@ -1165,7 +1635,7 @@ def main(argv: list[str] | None = None) -> int:
         "--limit",
         type=int,
         default=None,
-        help="Maximum articles to ingest per feed when using feeds (default: 10).",
+        help="Maximum articles to ingest per feed when using feeds (default: 25).",
     )
     summarize_parser.add_argument(
         "--feed",
@@ -1205,9 +1675,101 @@ def main(argv: list[str] | None = None) -> int:
         help="Run summarization in-memory without persistence (default: True).",
     )
 
+    # check-health & health
+    subparsers.add_parser(
+        "check-health",
+        help="Run comprehensive V1 operational health check (config, model, feeds, storage).",
+    )
+    subparsers.add_parser(
+        "health",
+        help="Alias for check-health.",
+    )
+
+    # pilot
+    pilot_parser = subparsers.add_parser(
+        "pilot",
+        help="Operator-supervised pilot review queue and decision management.",
+    )
+    pilot_subparsers = pilot_parser.add_subparsers(dest="pilot_action", required=True)
+
+    # pilot queue
+    queue_p = pilot_subparsers.add_parser("queue", help="List events in supervisory review queue.")
+    queue_p.add_argument(
+        "--status",
+        choices=["all", "pending", "approved", "downgraded", "rejected", "stale"],
+        default="all",
+        help="Filter enqueued events by status (default: all).",
+    )
+    queue_p.add_argument("--log-file", type=str, default=None, help="Custom pilot review log path.")
+    queue_p.add_argument("--queue-file", type=str, default=None, help="Custom pilot queue path.")
+
+    # pilot inspect <event_id>
+    inspect_p = pilot_subparsers.add_parser(
+        "inspect", help="Inspect event factual claims, evidence spans, and lineages."
+    )
+    inspect_p.add_argument("event_id", help="Event ID to inspect.")
+    inspect_p.add_argument(
+        "--log-file", type=str, default=None, help="Custom pilot review log path."
+    )
+    inspect_p.add_argument("--queue-file", type=str, default=None, help="Custom pilot queue path.")
+
+    # pilot review <event_id>
+    review_p = pilot_subparsers.add_parser(
+        "review", help="Record analyst decision for an enqueued event."
+    )
+    review_p.add_argument("event_id", help="Event ID to review.")
+    review_p.add_argument(
+        "--action",
+        required=True,
+        help="Review action (approve, downgrade_shared_origin, downgrade_official, reject, etc.).",
+    )
+    review_p.add_argument("--analyst-id", required=True, help="Analyst identity or callsign.")
+    review_p.add_argument(
+        "--reason", required=True, help="Mandatory explanation for review decision (min 10 chars)."
+    )
+    review_p.add_argument(
+        "--log-file", type=str, default=None, help="Custom pilot review log path."
+    )
+    review_p.add_argument("--queue-file", type=str, default=None, help="Custom pilot queue path.")
+
+    # pilot preview
+    preview_p = pilot_subparsers.add_parser(
+        "preview", help="Preview final briefing under operator supervision."
+    )
+    preview_p.add_argument(
+        "--fixture", action="store_true", default=False, help="Use local fixtures."
+    )
+    preview_p.add_argument(
+        "--mock-model", action="store_true", default=False, help="Use mock model."
+    )
+    preview_p.add_argument("--limit", type=int, default=None, help="Max articles per feed.")
+    preview_p.add_argument("--feed", type=str, default=None, help="Filter to specific feed name.")
+    preview_p.add_argument(
+        "--edition",
+        choices=["daily", "morning", "evening"],
+        default="daily",
+        help="Briefing edition (default: 'daily').",
+    )
+    preview_p.add_argument("--max-events", type=int, default=None, help="Max events to display.")
+    preview_p.add_argument(
+        "--candidate-cap",
+        type=int,
+        default=None,
+        help="Candidate cluster summarization cap (default: 12).",
+    )
+    preview_p.add_argument(
+        "--diagnostics", action="store_true", default=False, help="Display diagnostics."
+    )
+
     brief_parser = subparsers.add_parser(
         "brief",
         help="Format and deliver daily intelligence briefing to Telegram.",
+    )
+    brief_parser.add_argument(
+        "--pilot-supervision",
+        action="store_true",
+        default=False,
+        help="Run briefing under operator-supervised pilot in dry-run mode (mandatory approval).",
     )
     brief_parser.add_argument(
         "--preview",
@@ -1225,7 +1787,7 @@ def main(argv: list[str] | None = None) -> int:
         "--limit",
         type=int,
         default=None,
-        help="Maximum articles to ingest per feed when using feeds (default: 10).",
+        help="Maximum articles to ingest per feed when using feeds (default: 25).",
     )
     brief_parser.add_argument(
         "--feed",
@@ -1267,15 +1829,21 @@ def main(argv: list[str] | None = None) -> int:
     brief_parser.add_argument(
         "--edition",
         type=str,
-        choices=["morning", "evening"],
-        default=None,
-        help="Optional briefing edition label ('morning' or 'evening').",
+        choices=["daily", "morning", "evening"],
+        default="daily",
+        help="Briefing edition label ('daily', 'morning', or 'evening'; default: 'daily').",
     )
     brief_parser.add_argument(
         "--max-events",
         type=int,
         default=None,
         help="Optional maximum number of high-priority events (omitted events are noted).",
+    )
+    brief_parser.add_argument(
+        "--candidate-cap",
+        type=int,
+        default=None,
+        help="Maximum candidate event clusters to send to LLM summarization (default: 12).",
     )
     brief_parser.add_argument(
         "--lookback-hours",
@@ -1408,6 +1976,19 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     args = parser.parse_args(argv)
+
+    if args.command in ("check-health", "health"):
+        return handle_check_health()
+
+    if args.command == "pilot":
+        if args.pilot_action == "queue":
+            return handle_pilot_queue(args)
+        if args.pilot_action == "inspect":
+            return handle_pilot_inspect(args)
+        if args.pilot_action == "review":
+            return handle_pilot_review(args)
+        if args.pilot_action == "preview":
+            return handle_pilot_preview(args)
 
     if args.command == "check-config":
         return handle_check_config()

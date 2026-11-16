@@ -17,6 +17,7 @@ from geopulse.summarization.models import (
     EventSummary,
     SummarizationResult,
     SummaryClaim,
+    reconstruct_event_summary,
 )
 
 
@@ -33,8 +34,22 @@ def _make_dummy_result(
     published_at: datetime | None = None,
     confidence_qualification: str | None = None,
     sources: tuple[EventSourceAttribution, ...] | None = None,
+    corroboration_status: str | None = None,
 ) -> SummarizationResult:
     now_dt = published_at or datetime(2026, 10, 23, 10, 0, tzinfo=UTC)
+    if corroboration_status is None:
+        if confidence_label in ("corroborated", "independently_corroborated"):
+            c_status = "independently_corroborated"
+        elif confidence_label == "single_source":
+            c_status = "single_source"
+        elif confidence_label == "disputed":
+            c_status = "conflicting_evidence"
+        elif confidence_label in ("uncertain", "insufficient_information"):
+            c_status = "insufficient_information"
+        else:
+            c_status = "unassessed"
+    else:
+        c_status = corroboration_status
     art1 = ArticleRecord(
         source_name="Defense News",
         title="Missile strike reported",
@@ -62,6 +77,10 @@ def _make_dummy_result(
         is_analysis=is_analysis,
         confidence_label=confidence_label,
         articles=(art1, art2),
+        corroboration_status=c_status,
+        independent_chains_count=2
+        if c_status == "independently_corroborated"
+        else (1 if c_status == "single_source" else 0),
     )
     summary = EventSummary(
         event_id=evt.id,
@@ -91,6 +110,10 @@ def _make_dummy_result(
             ),
         ),
         model_used="test-model",
+        corroboration_status=c_status,
+        independent_chains_count=2
+        if c_status == "independently_corroborated"
+        else (1 if c_status == "single_source" else 0),
     )
     return SummarizationResult(
         event_id=evt.id,
@@ -661,6 +684,8 @@ def test_nuclear_exercise_corroboration_distinguishes_official_announcements():
             ),
         ),
         model_used="test-model",
+        corroboration_status="multiple_reports_shared_origin",
+        independent_chains_count=1,
     )
     block = formatter.format_event_block(
         summary=summary,
@@ -1183,3 +1208,488 @@ def test_formatter_and_digest_selection_rejects_genuinely_invalid_empty_body():
     formatter = TelegramDigestFormatter()
     selected = formatter.select_digest_events([res])
     assert len(selected) == 0
+
+
+# ===========================================================================
+# Phase 3 Unassessed Status Integrity Regression Tests
+# ===========================================================================
+def test_unassessed_event_with_legacy_corroborated_and_five_publishers():
+    """Unassessed event with legacy 'corroborated' label and 5 publishers must render
+    [NOT ASSESSED]."""
+    now = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
+    sources = tuple(
+        EventSourceAttribution(
+            source_name=name,
+            title=f"Report from {name}",
+            url=f"https://example.com/{name.lower().replace(' ', '')}",
+        )
+        for name in ("BBC News", "CNN", "The Guardian", "Reuters", "Al Jazeera")
+    )
+    # Direct model construction
+    summary = EventSummary(
+        event_id="evt-unassessed-5",
+        headline="Major Regional Diplomatic Summit Concludes",
+        what_happened=(
+            "Representatives discussed multilateral trade and maritime security protocols."
+        ),
+        confidence_qualification="unassessed",
+        sources=sources,
+        model_used="test-model",
+        corroboration_status="unassessed",
+        independent_chains_count=0,
+    )
+    event = EventCluster(
+        title="Diplomatic Summit Concludes",
+        category=TopicCategory.DIPLOMACY,
+        confidence_label="corroborated",
+        first_seen_at=now,
+        last_seen_at=now,
+        corroboration_status="unassessed",
+        independent_chains_count=0,
+    )
+    formatter = TelegramDigestFormatter()
+    block = formatter.format_event(
+        summary=summary,
+        event=event,
+        category=event.category,
+        confidence_label=event.confidence_label,
+        rank=1,
+        total=1,
+    )
+    assert "[NOT ASSESSED]" in block
+    assert "[CORROBORATED]" not in block
+    assert "[SINGLE SOURCE]" not in block
+    assert "Unassessed; corroboration analysis not performed." in block
+
+    # Database row reconstruction
+    row = {
+        "event_id": "evt-unassessed-5",
+        "headline": "Major Regional Diplomatic Summit Concludes",
+        "what_happened": "Representatives discussed multilateral trade protocols.",
+        "confidence_qualification": "unassessed",
+        "model_used": "legacy-model",
+        "corroboration_status": "unassessed",
+        "independent_chains_count": 0,
+        "key_details": {
+            "_evidence": {
+                "sources": [
+                    {"source_name": s.source_name, "title": s.title, "url": s.url} for s in sources
+                ]
+            }
+        },
+    }
+    recon = reconstruct_event_summary(row)
+    assert recon is not None
+    assert recon.corroboration_status == "unassessed"
+    assert recon.independent_chains_count == 0
+    recon_block = formatter.format_event(
+        summary=recon,
+        event=event,
+        category=event.category,
+        confidence_label=event.confidence_label,
+        rank=1,
+        total=1,
+    )
+    assert "[NOT ASSESSED]" in recon_block
+    assert "[CORROBORATED]" not in recon_block
+
+
+def test_unassessed_event_with_legacy_single_source_and_one_publisher():
+    """Unassessed event with legacy 'single_source' label and 1 publisher must render
+    [NOT ASSESSED]."""
+    now = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
+    source = EventSourceAttribution(
+        source_name="Financial Times",
+        title="Sanctions Proposal Drafted",
+        url="https://ft.com/sanctions-draft",
+    )
+    summary = EventSummary(
+        event_id="evt-unassessed-1",
+        headline="Sanctions Proposal Drafted for Industrial Chemicals",
+        what_happened=(
+            "Diplomats drafted an initial framework outlining potential export restrictions."
+        ),
+        confidence_qualification="unassessed",
+        sources=(source,),
+        model_used="test-model",
+        corroboration_status="unassessed",
+        independent_chains_count=0,
+    )
+    event = EventCluster(
+        title="Sanctions Framework Drafted",
+        category=TopicCategory.SANCTIONS,
+        confidence_label="single_source",
+        first_seen_at=now,
+        last_seen_at=now,
+        corroboration_status="unassessed",
+        independent_chains_count=0,
+    )
+    formatter = TelegramDigestFormatter()
+    block = formatter.format_event(
+        summary=summary,
+        event=event,
+        category=event.category,
+        confidence_label=event.confidence_label,
+        rank=1,
+        total=1,
+    )
+    assert "[NOT ASSESSED]" in block
+    assert "[SINGLE SOURCE]" not in block
+
+    # Database row reconstruction
+    row = {
+        "event_id": "evt-unassessed-1",
+        "headline": "Sanctions Proposal Drafted for Industrial Chemicals",
+        "what_happened": "Diplomats drafted an initial framework outlining restrictions.",
+        "corroboration_status": "unassessed",
+        "independent_chains_count": 0,
+        "key_details": {
+            "_evidence": {
+                "sources": [
+                    {"source_name": source.source_name, "title": source.title, "url": source.url}
+                ]
+            }
+        },
+    }
+    recon = reconstruct_event_summary(row)
+    assert recon is not None
+    recon_block = formatter.format_event(
+        summary=recon,
+        event=event,
+        category=event.category,
+        confidence_label=event.confidence_label,
+        rank=1,
+        total=1,
+    )
+    assert "[NOT ASSESSED]" in recon_block
+    assert "[SINGLE SOURCE]" not in recon_block
+
+
+def test_unassessed_event_with_zero_publishers():
+    """Unassessed event with zero publishers must render [NOT ASSESSED]."""
+    now = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
+    summary = EventSummary(
+        event_id="evt-unassessed-0",
+        headline="Border Patrol Observations Reported",
+        what_happened=(
+            "Regional authorities noted increased reconnaissance activity along the "
+            "demarcation zone."
+        ),
+        confidence_qualification="unassessed",
+        sources=(),
+        model_used="test-model",
+        corroboration_status="unassessed",
+        independent_chains_count=0,
+    )
+    event = EventCluster(
+        title="Border Patrol Observations",
+        category=TopicCategory.MILITARY_OPERATIONS,
+        confidence_label="corroborated",
+        first_seen_at=now,
+        last_seen_at=now,
+        corroboration_status="unassessed",
+        independent_chains_count=0,
+    )
+    formatter = TelegramDigestFormatter()
+    block = formatter.format_event(
+        summary=summary,
+        event=event,
+        category=event.category,
+        confidence_label=event.confidence_label,
+        rank=1,
+        total=1,
+    )
+    assert "[NOT ASSESSED]" in block
+    assert "[SINGLE SOURCE]" not in block
+    assert "[CORROBORATED]" not in block
+
+
+def test_missing_or_null_corroboration_status_handled_conservatively():
+    """Missing or NULL corroboration status in models and DB rows defaults to unassessed
+    and [NOT ASSESSED]."""
+    now = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
+    # Direct model construction with defaults
+    ec_default = EventCluster(
+        title="Default Event Cluster",
+        category=TopicCategory.SECURITY_INCIDENT,
+        first_seen_at=now,
+        last_seen_at=now,
+    )
+    assert ec_default.corroboration_status == "unassessed"
+    assert ec_default.independent_chains_count == 0
+
+    es_default = EventSummary(
+        event_id=ec_default.id,
+        headline="Default Event Summary Headline",
+        what_happened="Detailed explanation of the incident without explicit corroboration status.",
+        confidence_qualification="uncertain",
+        model_used="test-model",
+    )
+    assert es_default.corroboration_status == "unassessed"
+    assert es_default.independent_chains_count == 0
+
+    # Explicit None / null passed
+    ec_none = EventCluster(
+        title="Null Event Cluster",
+        category=TopicCategory.SECURITY_INCIDENT,
+        first_seen_at=now,
+        last_seen_at=now,
+        corroboration_status=None,
+        independent_chains_count=None,
+    )
+    assert ec_none.corroboration_status == "unassessed"
+    assert ec_none.independent_chains_count == 0
+
+    es_none = EventSummary(
+        event_id=ec_none.id,
+        headline="Null Event Summary Headline",
+        what_happened=(
+            "Explanation of the incident with explicit None supplied to corroboration fields."
+        ),
+        confidence_qualification="uncertain",
+        model_used="test-model",
+        corroboration_status=None,
+        independent_chains_count=None,
+    )
+    assert es_none.corroboration_status == "unassessed"
+    assert es_none.independent_chains_count == 0
+
+    formatter = TelegramDigestFormatter()
+    block = formatter.format_event(
+        summary=es_none,
+        event=ec_none,
+        category=ec_none.category,
+        confidence_label=ec_none.confidence_label,
+        rank=1,
+        total=1,
+    )
+    assert "[NOT ASSESSED]" in block
+
+    # DB row with missing / NULL columns
+    row_null = {
+        "event_id": ec_none.id,
+        "headline": "Database Row With Null Corroboration",
+        "what_happened": "Incident details from database record without corroboration fields.",
+        "corroboration_status": None,
+        "independent_chains_count": None,
+    }
+    recon = reconstruct_event_summary(row_null)
+    assert recon is not None
+    assert recon.corroboration_status == "unassessed"
+    assert recon.independent_chains_count == 0
+
+    recon_block = formatter.format_event(
+        summary=recon,
+        event=ec_none,
+        category=ec_none.category,
+        confidence_label=ec_none.confidence_label,
+        rank=1,
+        total=1,
+    )
+    assert "[NOT ASSESSED]" in recon_block
+
+
+def test_explicitly_assessed_corroborated_event():
+    """Explicitly assessed independently corroborated event renders [CORROBORATED]."""
+    now = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
+    s1 = EventSourceAttribution(
+        source_name="The Washington Post", title="T1", url="https://wapo.com/1"
+    )
+    s2 = EventSourceAttribution(
+        source_name="The Wall Street Journal", title="T2", url="https://wsj.com/2"
+    )
+    summary = EventSummary(
+        event_id="evt-corrob",
+        headline="Hardened Subterranean Fuel Storage Discovered",
+        what_happened=(
+            "Field records and geospatial satellite analysis independently confirmed fuel depots."
+        ),
+        confidence_qualification="Independently corroborated across 2 distinct reporting chains.",
+        sources=(s1, s2),
+        model_used="test-model",
+        corroboration_status="independently_corroborated",
+        independent_chains_count=2,
+    )
+    event = EventCluster(
+        title="Fuel Depot Construction",
+        category=TopicCategory.MILITARY_OPERATIONS,
+        first_seen_at=now,
+        last_seen_at=now,
+        corroboration_status="independently_corroborated",
+        independent_chains_count=2,
+    )
+    formatter = TelegramDigestFormatter()
+    block = formatter.format_event(
+        summary=summary,
+        event=event,
+        category=event.category,
+        confidence_label="corroborated",
+        rank=1,
+        total=1,
+    )
+    assert "[CORROBORATED]" in block
+    assert "[NOT ASSESSED]" not in block
+
+
+def test_explicitly_assessed_single_source_event():
+    """Explicitly assessed single-source event renders [SINGLE SOURCE]."""
+    now = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
+    s1 = EventSourceAttribution(
+        source_name="Defense News", title="T1", url="https://defensenews.com/1"
+    )
+    summary = EventSummary(
+        event_id="evt-single",
+        headline="Procurement Tender Announced for Coastal Radar Systems",
+        what_happened=(
+            "Defense authorities released initial tender documentation for coastal \
+            radar monitoring."
+        ),
+        confidence_qualification=(
+            "Single-source reporting from Defense News; unverified independently."
+        ),
+        sources=(s1,),
+        model_used="test-model",
+        corroboration_status="single_source",
+        independent_chains_count=1,
+    )
+    event = EventCluster(
+        title="Radar Procurement Tender",
+        category=TopicCategory.WEAPONS_PROCUREMENT,
+        first_seen_at=now,
+        last_seen_at=now,
+        corroboration_status="single_source",
+        independent_chains_count=1,
+    )
+    formatter = TelegramDigestFormatter()
+    block = formatter.format_event(
+        summary=summary,
+        event=event,
+        category=event.category,
+        confidence_label="single_source",
+        rank=1,
+        total=1,
+    )
+    assert "[SINGLE SOURCE]" in block
+    assert "[NOT ASSESSED]" not in block
+
+
+def test_existing_conflicting_and_shared_origin_statuses():
+    """Conflicting evidence, shared origin, and preliminary statuses retain correct badges."""
+    now = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
+    formatter = TelegramDigestFormatter()
+
+    # Conflicting evidence -> [DISPUTED]
+    sum_conflict = EventSummary(
+        event_id="evt-dispute",
+        headline="Contested Air Defense Interception Claims",
+        what_happened=(
+            "Opposing claims on whether drone attack was intercepted or destroyed facility."
+        ),
+        confidence_qualification="Contested claims; opposing parties provide conflicting accounts.",
+        model_used="test-model",
+        corroboration_status="conflicting_evidence",
+        independent_chains_count=0,
+    )
+    ev_conflict = EventCluster(
+        title="Substation Strike Claims",
+        category=TopicCategory.ARMED_CONFLICT,
+        first_seen_at=now,
+        last_seen_at=now,
+        corroboration_status="conflicting_evidence",
+        independent_chains_count=0,
+    )
+    block_conflict = formatter.format_event(
+        summary=sum_conflict,
+        event=ev_conflict,
+        category=ev_conflict.category,
+        confidence_label="disputed",
+        rank=1,
+        total=1,
+    )
+    assert "[DISPUTED]" in block_conflict
+    assert "[NOT ASSESSED]" not in block_conflict
+
+    # Shared origin -> [SHARED ORIGIN]
+    sum_shared = EventSummary(
+        event_id="evt-shared",
+        headline="Naval Drone Attack Reported Near Sevastopol",
+        what_happened=(
+            "Multiple outlets reported the patrol vessel incident citing a single Reuters dispatch."
+        ),
+        confidence_qualification=(
+            "Reported across 5 publishers, but all rely on a single shared wire report."
+        ),
+        model_used="test-model",
+        corroboration_status="multiple_reports_shared_origin",
+        independent_chains_count=1,
+    )
+    ev_shared = EventCluster(
+        title="Black Sea Naval Drone Attack",
+        category=TopicCategory.ARMED_CONFLICT,
+        first_seen_at=now,
+        last_seen_at=now,
+        corroboration_status="multiple_reports_shared_origin",
+        independent_chains_count=1,
+    )
+    block_shared = formatter.format_event(
+        summary=sum_shared,
+        event=ev_shared,
+        category=ev_shared.category,
+        confidence_label="corroborated",
+        rank=1,
+        total=1,
+    )
+    assert "[SHARED ORIGIN]" in block_shared
+    assert "[NOT ASSESSED]" not in block_shared
+
+    # Shared origin with official announcement -> [OFFICIAL ANNOUNCEMENT]
+    s_official = EventSourceAttribution(
+        source_name="Ministry of Defense",
+        title="Official Statement",
+        url="https://mod.gov.example/press",
+    )
+    sum_official = EventSummary(
+        event_id="evt-official",
+        headline="Procurement of Three Air Defense Batteries Announced",
+        what_happened=(
+            "The defense ministry announced purchase of three mobile air defense batteries."
+        ),
+        confidence_qualification="Official announcement from Ministry of Defense.",
+        sources=(s_official,),
+        model_used="test-model",
+        corroboration_status="multiple_reports_shared_origin",
+        independent_chains_count=1,
+    )
+    block_official = formatter.format_event(
+        summary=sum_official,
+        event=ev_shared,
+        category=ev_shared.category,
+        confidence_label="corroborated",
+        rank=1,
+        total=1,
+    )
+    assert "[OFFICIAL ANNOUNCEMENT]" in block_official
+    assert "[NOT ASSESSED]" not in block_official
+
+    # Insufficient information -> [PRELIMINARY]
+    sum_prelim = EventSummary(
+        event_id="evt-prelim",
+        headline="Unconfirmed Rumors Allege Hypersonic Battery Movement",
+        what_happened=(
+            "Online chatter claims missile units were relocated without official confirmation."
+        ),
+        confidence_qualification="Preliminary reporting; source relationships unverified.",
+        model_used="test-model",
+        corroboration_status="insufficient_information",
+        independent_chains_count=0,
+    )
+    block_prelim = formatter.format_event(
+        summary=sum_prelim,
+        event=ev_conflict,
+        category=ev_conflict.category,
+        confidence_label="uncertain",
+        rank=1,
+        total=1,
+    )
+    assert "[PRELIMINARY]" in block_prelim
+    assert "[NOT ASSESSED]" not in block_prelim

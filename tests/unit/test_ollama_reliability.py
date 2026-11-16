@@ -11,6 +11,8 @@ Covers:
 """
 
 import json
+import threading
+import time
 from datetime import UTC, datetime
 
 import httpx
@@ -116,6 +118,424 @@ def test_ollama_timeout_handling_raises_timeout_error():
     assert call_count == 1
 
 
+def test_ollama_streaming_response_respects_outer_wall_clock_deadline():
+    """Streaming response yielding chunks faster than socket read timeout is capped by deadline."""
+
+    class SlowSyncStream(httpx.SyncByteStream):
+        def __iter__(self):
+            for _ in range(25):
+                time.sleep(0.03)
+                yield b'{"response": '
+            yield b'"done"}'
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=SlowSyncStream())
+
+    transport = httpx.MockTransport(mock_handler)
+    client = OllamaClient(
+        base_url="http://localhost:11434",
+        request_timeout=0.20,
+        read_timeout=0.8,
+        max_retries=0,
+        transport=transport,
+    )
+
+    t0 = time.perf_counter()
+    with pytest.raises(OllamaTimeoutError) as exc_info:
+        client.generate(prompt="Test prompt", format_type="json")
+    elapsed = time.perf_counter() - t0
+
+    client.close()
+    assert "timed out" in str(exc_info.value).lower() or "deadline" in str(exc_info.value).lower()
+    assert elapsed < 0.45, f"Expected <0.45s, took {elapsed:.2f}s"
+
+
+def test_ollama_worker_blocks_beyond_deadline():
+    """When a worker blocks in an HTTP call, main thread returns at wall-clock deadline."""
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        time.sleep(2.0)
+        return httpx.Response(200, json={"response": "{}"})
+
+    transport = httpx.MockTransport(mock_handler)
+    client = OllamaClient(
+        base_url="http://localhost:11434",
+        request_timeout=0.20,
+        read_timeout=0.8,
+        max_retries=0,
+        transport=transport,
+    )
+
+    t0 = time.perf_counter()
+    with pytest.raises(OllamaTimeoutError) as exc_info:
+        client.generate(prompt="Test prompt", format_type="json")
+    elapsed = time.perf_counter() - t0
+
+    client.close()
+    assert "exceeded wall-clock deadline" in str(exc_info.value).lower()
+    assert elapsed < 0.50, f"Expected <0.50s, took {elapsed:.2f}s"
+
+
+def test_ollama_cleanup_raising_exception_does_not_mask_timeout():
+    """Exceptions raised during resource cleanup do not suppress the OllamaTimeoutError."""
+
+    class FailingTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            time.sleep(2.0)
+            return httpx.Response(200, json={"response": "{}"})
+
+        def close(self) -> None:
+            raise RuntimeError("Transport teardown failed")
+
+    transport = FailingTransport()
+    client = OllamaClient(
+        base_url="http://localhost:11434",
+        request_timeout=0.15,
+        read_timeout=0.5,
+        max_retries=0,
+        transport=transport,
+    )
+
+    t0 = time.perf_counter()
+    with pytest.raises(OllamaTimeoutError) as exc_info:
+        client.generate(prompt="Test prompt", format_type="json")
+    elapsed = time.perf_counter() - t0
+
+    client.close()
+    assert "exceeded wall-clock deadline" in str(exc_info.value).lower()
+    assert elapsed < 0.45, f"Expected <0.45s, took {elapsed:.2f}s"
+
+
+def test_ollama_timed_out_request_followed_by_new_request():
+    """A timed-out request releases state so subsequent requests execute on a fresh client."""
+    call_count = 0
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            time.sleep(2.0)
+            return httpx.Response(200, json={"response": "{}"})
+        return httpx.Response(200, json={"response": '{"claims": ["fast_ok"]}'})
+
+    transport = httpx.MockTransport(mock_handler)
+    client = OllamaClient(
+        base_url="http://localhost:11434",
+        request_timeout=0.20,
+        read_timeout=0.8,
+        max_retries=0,
+        transport=transport,
+    )
+
+    # First request: times out in ~0.20s
+    t0 = time.perf_counter()
+    with pytest.raises(OllamaTimeoutError):
+        client.generate(prompt="Slow prompt", format_type="json")
+    elapsed1 = time.perf_counter() - t0
+    assert elapsed1 < 0.50, f"Expected <0.50s, took {elapsed1:.2f}s"
+
+    # Second request: executes immediately and succeeds
+    t1 = time.perf_counter()
+    res = client.generate(prompt="Fast prompt", format_type="json")
+    elapsed2 = time.perf_counter() - t1
+
+    client.close()
+    assert res == '{"claims": ["fast_ok"]}'
+    assert elapsed2 < 0.25, f"Expected <0.25s for fast request, took {elapsed2:.2f}s"
+
+
+def test_ollama_retry_and_streaming_respects_total_wall_clock_deadline():
+    """Combined duration across connection retry, backoff, and streaming respects total timeout."""
+
+    class SlowSyncStream(httpx.SyncByteStream):
+        def __iter__(self):
+            for _ in range(15):
+                time.sleep(0.05)
+                yield b'{"response": '
+            yield b'"done"}'
+
+    call_count = 0
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            time.sleep(0.1)
+            raise httpx.RemoteProtocolError("connection dropped")
+        return httpx.Response(200, stream=SlowSyncStream())
+
+    transport = httpx.MockTransport(mock_handler)
+    client = OllamaClient(
+        base_url="http://localhost:11434",
+        request_timeout=0.9,
+        read_timeout=0.8,
+        max_retries=1,
+        transport=transport,
+    )
+
+    t0 = time.perf_counter()
+    with pytest.raises(OllamaTimeoutError) as exc_info:
+        client.generate(prompt="Test prompt", format_type="json")
+    elapsed = time.perf_counter() - t0
+
+    client.close()
+    assert "timed out" in str(exc_info.value).lower() or "deadline" in str(exc_info.value).lower()
+    assert call_count >= 1
+    assert 0.85 <= elapsed <= 1.25, f"Expected ~0.9s, took {elapsed:.2f}s"
+
+
+def test_ollama_retries_fail_fast_when_backoff_exceeds_deadline():
+    """When retry backoff delay would exceed the remaining deadline, fail fast immediately."""
+    call_count = 0
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        time.sleep(0.10)
+        raise httpx.RemoteProtocolError("server reset connection")
+
+    transport = httpx.MockTransport(mock_handler)
+    client = OllamaClient(
+        base_url="http://localhost:11434",
+        request_timeout=0.35,
+        read_timeout=0.8,
+        max_retries=1,
+        transport=transport,
+    )
+
+    t0 = time.perf_counter()
+    with pytest.raises(OllamaTimeoutError) as exc_info:
+        client.generate(prompt="Test prompt", format_type="json")
+    elapsed = time.perf_counter() - t0
+
+    client.close()
+    assert "exceeded wall-clock deadline" in str(exc_info.value).lower()
+    assert elapsed < 0.45, f"Expected <0.45s, took {elapsed:.2f}s"
+
+
+def test_ollama_normal_successful_streaming():
+    """A streaming response that finishes within deadline parses and returns successfully."""
+
+    class NormalSyncStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b'{"response": "'
+            yield b'{\\"claims\\": [\\"c1\\"]}'
+            yield b'"}'
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=NormalSyncStream())
+
+    transport = httpx.MockTransport(mock_handler)
+    client = OllamaClient(
+        base_url="http://localhost:11434",
+        request_timeout=1.0,
+        read_timeout=0.8,
+        max_retries=0,
+        transport=transport,
+    )
+
+    t0 = time.perf_counter()
+    result = client.generate(prompt="Normal prompt", format_type="json")
+    elapsed = time.perf_counter() - t0
+
+    client.close()
+    assert result == '{"claims": ["c1"]}'
+    assert elapsed < 0.20, f"Expected <0.20s, took {elapsed:.2f}s"
+
+
+def test_ollama_timeout_reports_accurate_elapsed_time():
+    """OllamaTimeoutError message and metrics accurately record the measured elapsed duration."""
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        time.sleep(2.0)
+        return httpx.Response(200, json={"response": "{}"})
+
+    transport = httpx.MockTransport(mock_handler)
+    client = OllamaClient(
+        base_url="http://localhost:11434",
+        request_timeout=0.30,
+        read_timeout=0.8,
+        max_retries=0,
+        transport=transport,
+    )
+
+    with pytest.raises(OllamaTimeoutError) as exc_info:
+        client.generate(prompt="Timing prompt", format_type="json")
+
+    client.close()
+    err_msg = str(exc_info.value)
+    assert "exceeded wall-clock deadline of 0.3s" in err_msg
+    assert "elapsed=" in err_msg
+    # Extract reported elapsed value and verify it is ~0.30s
+    import re
+
+    match = re.search(r"elapsed=([0-9\.]+)s", err_msg)
+    assert match is not None
+    reported_elapsed = float(match.group(1))
+    assert 0.28 <= reported_elapsed <= 0.55, f"Reported elapsed was {reported_elapsed}s"
+
+
+def test_ollama_abandoned_worker_tracked_until_exit():
+    """One timed-out worker remains counted while running, and is released upon exit."""
+    unblock = threading.Event()
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        unblock.wait(timeout=2.0)
+        return httpx.Response(200, json={"response": "{}"})
+
+    transport = httpx.MockTransport(mock_handler)
+    client = OllamaClient(
+        base_url="http://localhost:11434",
+        request_timeout=0.15,
+        max_abandoned_workers=2,
+        max_retries=0,
+        transport=transport,
+    )
+
+    with pytest.raises(OllamaTimeoutError):
+        client.generate(prompt="Tracked prompt", format_type="json")
+
+    # While worker is blocked, abandoned count is 1
+    assert client.abandoned_workers_count == 1
+
+    # Unblock the background worker and verify count is released
+    unblock.set()
+    for _ in range(50):
+        if client.abandoned_workers_count == 0:
+            break
+        time.sleep(0.02)
+
+    assert client.abandoned_workers_count == 0
+    client.close()
+
+
+def test_ollama_two_abandoned_workers_cause_immediate_rejection():
+    """Two outstanding abandoned workers cause the next request to fail fast without resources."""
+    unblock = threading.Event()
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        unblock.wait(timeout=2.0)
+        return httpx.Response(200, json={"response": "{}"})
+
+    transport = httpx.MockTransport(mock_handler)
+    client = OllamaClient(
+        base_url="http://localhost:11434",
+        request_timeout=0.10,
+        max_abandoned_workers=2,
+        max_retries=0,
+        transport=transport,
+    )
+
+    # 1. First timeout
+    with pytest.raises(OllamaTimeoutError):
+        client.generate(prompt="Prompt 1", format_type="json")
+    assert client.abandoned_workers_count == 1
+
+    # 2. Second timeout
+    with pytest.raises(OllamaTimeoutError):
+        client.generate(prompt="Prompt 2", format_type="json")
+    assert client.abandoned_workers_count == 2
+    assert client._client is None
+    assert client._executor is None
+
+    # 3. Third request must fail immediately without allocating client or executor
+    t0 = time.perf_counter()
+    with pytest.raises(OllamaTimeoutError) as exc_info:
+        client.generate(prompt="Prompt 3", format_type="json")
+    elapsed = time.perf_counter() - t0
+
+    assert elapsed < 0.05, f"Expected immediate fail fast (<0.05s), took {elapsed:.3f}s"
+    assert "abandoned worker(s) are still active" in str(exc_info.value)
+    assert client._client is None
+    assert client._executor is None
+
+    # Clean up background threads
+    unblock.set()
+    for _ in range(50):
+        if client.abandoned_workers_count == 0:
+            break
+        time.sleep(0.02)
+    assert client.abandoned_workers_count == 0
+    client.close()
+
+
+def test_ollama_completed_abandoned_worker_allows_later_request():
+    """When an abandoned worker exits, subsequent requests are permitted and succeed."""
+    unblock1 = threading.Event()
+    unblock2 = threading.Event()
+    call_count = 0
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            unblock1.wait(timeout=2.0)
+            return httpx.Response(200, json={"response": "{}"})
+        if call_count == 2:
+            unblock2.wait(timeout=2.0)
+            return httpx.Response(200, json={"response": "{}"})
+        return httpx.Response(200, json={"response": '{"claims": ["later_ok"]}'})
+
+    transport = httpx.MockTransport(mock_handler)
+    client = OllamaClient(
+        base_url="http://localhost:11434",
+        request_timeout=0.10,
+        max_abandoned_workers=2,
+        max_retries=0,
+        transport=transport,
+    )
+
+    with pytest.raises(OllamaTimeoutError):
+        client.generate(prompt="Prompt 1", format_type="json")
+    with pytest.raises(OllamaTimeoutError):
+        client.generate(prompt="Prompt 2", format_type="json")
+    assert client.abandoned_workers_count == 2
+
+    # Release worker 1 and wait for count to drop to 1
+    unblock1.set()
+    for _ in range(50):
+        if client.abandoned_workers_count == 1:
+            break
+        time.sleep(0.02)
+    assert client.abandoned_workers_count == 1
+
+    # Later request is permitted and succeeds
+    res = client.generate(prompt="Prompt 3", format_type="json")
+    assert res == '{"claims": ["later_ok"]}'
+
+    unblock2.set()
+    for _ in range(50):
+        if client.abandoned_workers_count == 0:
+            break
+        time.sleep(0.02)
+    assert client.abandoned_workers_count == 0
+    client.close()
+
+
+def test_ollama_concurrent_timeout_callbacks_do_not_corrupt_count():
+    """Concurrent completion callbacks thread-safely decrement count without corruption."""
+    from concurrent.futures import Future
+
+    client = OllamaClient(base_url="http://localhost:11434", max_abandoned_workers=5)
+    futures = [Future() for _ in range(5)]
+
+    for f in futures:
+        client._track_abandoned_worker(f)
+    assert client.abandoned_workers_count == 5
+
+    def complete_future(f: Future):
+        f.set_result(None)
+
+    threads = [threading.Thread(target=complete_future, args=(f,)) for f in futures]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert client.abandoned_workers_count == 0
+    client.close()
+
+
 def test_ollama_token_repeat_limit_error_recovery():
     """Client handles 500 repeat error by tightening repeat options and recovering on retry."""
     call_count = 0
@@ -215,9 +635,9 @@ def test_ollama_stage_specific_output_budgets():
     )
 
     # 1. Check budget constants are aligned with CPU hardware profile (8.28 tok/s)
-    assert STAGE_BUDGET_CLAIMS == 320
+    assert STAGE_BUDGET_CLAIMS == 512
     assert STAGE_BUDGET_VERIFIER == 160
-    assert STAGE_BUDGET_CORRECTION == 320
+    assert STAGE_BUDGET_CORRECTION == 512
     assert STAGE_BUDGET_QA == 256
 
     # 2. Check EventSummarizer passes budgets to model calls

@@ -151,10 +151,10 @@ def test_settings_supabase_key_category():
 def test_feed_limit_default_and_validation(monkeypatch):
     monkeypatch.delenv("FEED_LIMIT", raising=False)
     s = Settings(_env_file=None)
-    assert s.feed_limit == 10
+    assert s.feed_limit == 25
 
-    s_custom = Settings(_env_file=None, feed_limit=25)
-    assert s_custom.feed_limit == 25
+    s_custom = Settings(_env_file=None, feed_limit=50)
+    assert s_custom.feed_limit == 50
 
     with pytest.raises(ValidationError):
         Settings(_env_file=None, feed_limit=0)

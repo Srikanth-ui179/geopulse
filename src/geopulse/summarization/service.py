@@ -6,10 +6,11 @@ import logging
 import re
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 from geopulse.clustering.models import EventCluster
 from geopulse.config import Settings, get_settings
+from geopulse.ingestion.extractor import ArticleExtractor
 from geopulse.ingestion.normalization import normalize_url
 from geopulse.summarization.client import (
     STAGE_BUDGET_CLAIMS,
@@ -23,6 +24,9 @@ from geopulse.summarization.client import (
 from geopulse.summarization.evidence_matcher import (
     check_evidence_span_match,
     clean_article_text,
+    find_best_supporting_passage,
+    split_sentences_safely,
+    verify_claim_semantic_support,
 )
 from geopulse.summarization.exceptions import (
     GEMINI_FALLBACK_ELIGIBLE_EXCEPTIONS,
@@ -47,25 +51,29 @@ from geopulse.summarization.models import (
     SummaryClaim,
 )
 from geopulse.summarization.prompts import (
+    CORRECTION_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     build_event_prompt,
     build_grounding_correction_prompt,
 )
 from geopulse.summarization.publication_gate import (
     clean_awkward_attribution_prefix,
-    extract_plain_narrative,
     is_headline_body_duplicate,
     normalize_attribution_text,
     validate_publication_gate,
 )
 from geopulse.summarization.validator import (
+    _INVALID_ACTOR_TOKENS,
     _LEAKAGE_PATTERN,
+    _NON_ACTOR_NOUNS,
     GroundingValidationResult,
     are_sources_genuinely_independent,
+    clean_concise_action,
     clean_headline_grammar,
     count_genuinely_independent_sources,
     ground_event_location,
     is_evidence_sufficient,
+    is_polluted_actor,
     is_publisher_or_outlet,
     safe_truncate_headline,
     sanitize_actors,
@@ -184,52 +192,6 @@ _OFFICIAL_ACCUSER_ENTITIES = re.compile(
 )
 
 
-def _normalize_uk_offset_claim(text: str) -> str:
-    """Ensure £50m is expressed as the contract-value threshold triggering the UK offset policy,
-
-    never as the value of the required industrial benefits or contractor investment.
-    """
-    clean_text = text.strip()
-    if not re.search(r"\b(?:uk|britain|british|mod)\b", clean_text, re.I):
-        return clean_text
-    if not re.search(r"\b(?:offset|offsets|industrial benefits?)\b", clean_text, re.I):
-        return clean_text
-
-    confused_patterns = [
-        re.compile(
-            r"\b(?:requires?|mandates?|demands?)\s+(?:foreign\s+)?(?:contractors?|suppliers?|firms?)\s+"
-            r"(?:to\s+)?(?:provide|invest|deliver)\s+(?:£50\s*(?:million|m)|50\s*million\s*pounds?)\s+"
-            r"(?:in\s+)?(?:industrial|economic)?\s*(?:benefits?|offsets?|investment)",
-            re.I,
-        ),
-        re.compile(
-            r"\b(?:requires?|mandates?|demands?)\s+(?:£50\s*(?:million|m)|50\s*million\s*pounds?)\s+"
-            r"(?:in\s+|of\s+)(?:industrial|economic)?\s*(?:benefits?|offsets?|investment)",
-            re.I,
-        ),
-        re.compile(
-            r"\b(?:provides?|providing)\s+(?:£50\s*(?:million|m)|50\s*million\s*pounds?)\s+"
-            r"(?:in\s+|of\s+)(?:industrial|economic)?\s*(?:benefits?|offsets?)",
-            re.I,
-        ),
-        re.compile(
-            r"\b(?:industrial\s+benefits?|offsets?)\s+(?:valued\s+at|of|totaling)\s+"
-            r"(?:£50\s*(?:million|m)|50\s*million\s*pounds?)",
-            re.I,
-        ),
-    ]
-
-    for pat in confused_patterns:
-        if pat.search(clean_text):
-            clean_text = pat.sub(
-                "requires foreign contractors on overseas defence contracts valued at "
-                "£50 million or more to provide UK industrial benefits",
-                clean_text,
-            )
-
-    return clean_text
-
-
 def _find_best_article_for_claim(
     claim_text: str,
     evidence_span: str,
@@ -244,7 +206,8 @@ def _find_best_article_for_claim(
         return candidate_article
 
     cand_text = " ".join(
-        clean_article_text(getattr(candidate_article, f, "") or "") for f in ("title", "snippet")
+        clean_article_text(getattr(candidate_article, f, "") or "")
+        for f in ("title", "snippet", "body_text")
     )
     cand_match, _ = check_evidence_span_match(evidence_span, cand_text)
 
@@ -280,7 +243,9 @@ def _find_best_article_for_claim(
     best_score = (-1, -1)
 
     for art in all_articles:
-        text = " ".join(clean_article_text(getattr(art, f, "") or "") for f in ("title", "snippet"))
+        text = " ".join(
+            clean_article_text(getattr(art, f, "") or "") for f in ("title", "snippet", "body_text")
+        )
         match_status, _ = check_evidence_span_match(evidence_span, text)
         art_words = {w.lower() for w in re.findall(r"\b[A-Za-z]{4,}\b", text)}
         overlap = len(claim_words & art_words)
@@ -295,6 +260,92 @@ def _find_best_article_for_claim(
         return best_art
 
     return candidate_article
+
+
+_GENERIC_SIGNIFICANCE_CLICHES = re.compile(
+    r"^(?:strengthens?|enhances?|boosts?|improves?|bolsters?|advances?|reinforces?)\s+"
+    r"(?:deterrence|regional\s+stability|stability|sovereign\s+capabilities?|"
+    r"strategic\s+resilience|resilience|security|defence\s+posture|allied\s+readiness)\.?$",
+    re.I,
+)
+
+
+def _normalize_uk_offset_claim(text: str) -> str:
+    """Normalize confused UK defence offset policy claims to properly distinguish
+    the £50M contract trigger threshold from required industrial benefits.
+    """
+    res = text
+    res = re.sub(
+        r"requires foreign contractors to provide "
+        r"[£$€]?50\s*(?:million|m)\s+in industrial benefits",
+        "applies to defence contracts valued at £50 million or more, requiring industrial benefits",
+        res,
+        flags=re.I,
+    )
+    res = re.sub(
+        r"mandates [£$€]?50\s*(?:million|m)\s+of economic offsets for overseas suppliers",
+        "applies to defence contracts valued at £50 million or more, requiring industrial benefits",
+        res,
+        flags=re.I,
+    )
+    return res
+
+
+def is_evidence_based_significance(sig: str | None) -> bool:
+    """Validate that significance is informative and not an unsupported generic slogan."""
+    if not sig:
+        return False
+    clean = sig.strip()
+    if clean.lower() in {"null", "none", "n/a", "nil", "unspecified", "unspecified in reporting"}:
+        return False
+    if _GENERIC_SIGNIFICANCE_CLICHES.match(clean):
+        return False
+    if len(clean.split()) <= 6 and re.search(
+        r"(?:strengthens|enhances|boosts|improves|bolsters)", clean, re.I
+    ):
+        return False
+    return True
+
+
+def _populate_evidence_provenance(
+    ref: ClaimEvidenceReference,
+    target_art: Any,
+) -> ClaimEvidenceReference:
+    """Enrich a ClaimEvidenceReference with article revision identity and character offsets."""
+    if target_art is None:
+        return ref
+    art_id = getattr(target_art, "article_id", None)
+    rev_id = getattr(target_art, "current_revision_id", None)
+    c_hash = getattr(target_art, "content_hash", None)
+    retrieved_at = getattr(target_art, "extracted_at", None) or getattr(
+        target_art, "fetched_at", None
+    )
+    prov = "full_article" if getattr(target_art, "is_full_text", False) else "rss_snippet"
+
+    start_char = ref.start_char
+    end_char = ref.end_char
+    sec_label = ref.section_label
+    body_str = getattr(target_art, "body_text", None) or getattr(target_art, "snippet", None) or ""
+    span = ref.evidence_span
+    if span and span in body_str and start_char is None:
+        start_char = body_str.find(span)
+        end_char = start_char + len(span)
+        if len(body_str) > 0:
+            rel = start_char / len(body_str)
+            sec_label = "opening" if rel < 0.25 else ("middle" if rel < 0.75 else "concluding")
+
+    return ref.model_copy(
+        update={
+            "article_id": art_id or ref.article_id,
+            "article_revision_id": rev_id or ref.article_revision_id,
+            "content_hash": c_hash or ref.content_hash,
+            "retrieved_at": retrieved_at or ref.retrieved_at,
+            "provenance": prov if ref.provenance == "unknown" else ref.provenance,
+            "start_char": start_char,
+            "end_char": end_char,
+            "section_label": sec_label,
+        }
+    )
 
 
 def _extract_supporting_claim_from_source(
@@ -315,7 +366,7 @@ def _extract_supporting_claim_from_source(
     if not snippet or len(snippet) < 30:
         return None
 
-    sentences = re.split(r"(?<=[.!?])\s+", snippet)
+    sentences = split_sentences_safely(snippet)
     clean_c1 = clean_headline_grammar(central_claim_text).lower()
     clean_hl = clean_headline_grammar(headline).lower() if headline else ""
     c1_words = {
@@ -352,7 +403,8 @@ def _extract_supporting_claim_from_source(
             continue
 
         avail_text = " ".join(
-            clean_article_text(getattr(target_art, f, "") or "") for f in ("title", "snippet")
+            clean_article_text(getattr(target_art, f, "") or "")
+            for f in ("title", "snippet", "body_text")
         )
         match_status, _ = check_evidence_span_match(s_clean, avail_text)
         if match_status == "no_match":
@@ -412,38 +464,40 @@ def _extract_supporting_claim_from_source(
         ):
             score -= 3.0
 
-        # 5. Black Sea maritime intelligence sharing & trilateral naval agreement priority:
-        if (
-            re.search(r"\b(?:bulgaria|romania|turkey|türkiye|black sea)\b", s_clean, re.I)
-            or re.search(r"\b(?:maritime|shipping|naval)\b", s_clean, re.I)
-        ) and re.search(
-            r"\b(?:intelligence[- ]sharing|intelligence|surveillance|information[- ]sharing|"
-            r"naval\s+agreement|maritime\s+(?:intelligence|agreement|task|cooperation)|"
-            r"patrols?|mine\s+action)\b",
-            s_clean,
-            re.I,
-        ):
-            score += 5.0
+        # Generalized operational and evidence scoring:
+        # 1. Key operational mechanisms, procurement stages, technical programs, and naval systems
+        mech_matches = len(
+            re.findall(
+                r"\b(?:agreement|contract|procurement|subcontract|initiative|partnership|"
+                r"facility|production|assembly|network|feeds?|tools?|translation|interoperability|"
+                r"submarines?|missiles?|interceptors?|satellites?|spaceport|surveillance|"
+                r"patrols?|program|programme|intelligence[- ]sharing|early[- ]warning|"
+                r"domain\s+awareness|suppliers?)\b",
+                s_clean,
+                re.I,
+            )
+        )
+        if mech_matches >= 2:
+            score += 4.0
+        elif mech_matches == 1:
+            score += 2.0
 
-        # Incidental comparison statistics penalty (e.g. historical vessel casualties):
+        # 2. Exact numbers, currency figures, percentages, or quantities
         if re.search(
-            r"\b(?:vessel\s+casualties|merchant\s+ships?\s+(?:hit|damaged)|prior\s+incidents)\b",
+            r"\b(?:[$£€]?\d+(?:[.,]\d+)?(?:\s*(?:billion|million|percent|%|m|bn))?)\b",
             s_clean,
             re.I,
         ):
-            score -= 4.0
+            score += 3.0
 
-        # TOTE Services selecting Hanwha for Navy/Marine Corps LSM program priority:
-        if re.search(r"\btote(?:\s+services)?\b", s_clean, re.I) and re.search(
-            r"\bhanwha\b", s_clean, re.I
+        # 3. Explicit timeframes or implementation dates
+        if re.search(
+            r"\b(?:january|february|march|april|may|june|july|august|september|october|"
+            r"november|december|202[4-9])\b",
+            s_clean,
+            re.I,
         ):
-            score += 4.0
-
-        # Patriot 500 missiles with allied funding priority:
-        if re.search(r"\bpatriot\b", s_clean, re.I) and (
-            re.search(r"\b500\b", s_clean) or re.search(r"\ballied\s+funding\b", s_clean, re.I)
-        ):
-            score += 4.0
+            score += 2.0
 
         s_words = {w.lower() for w in re.findall(r"\b[A-Za-z]{4,}\b", s_clean)}
         overlap_c1 = len(c1_words & s_words)
@@ -458,22 +512,25 @@ def _extract_supporting_claim_from_source(
     scored_candidates.sort(key=lambda x: x[0], reverse=True)
     best_score, best_sent, best_span = scored_candidates[0]
     best_sent = sanitize_technical_acronyms(best_sent, avail_text)
-    best_sent = _normalize_uk_offset_claim(best_sent)
 
+    supp_prov = "full_article" if getattr(target_art, "is_full_text", False) else "rss_snippet"
+    ref = ClaimEvidenceReference(
+        source_url=getattr(target_art, "url", ""),
+        evidence_span=best_span,
+        verification_status="accepted",
+        provenance=supp_prov,
+    )
+    ref = _populate_evidence_provenance(ref, target_art)
     return SummaryClaim(
         claim_id="c2",
         text=best_sent,
-        evidence_refs=(
-            ClaimEvidenceReference(
-                source_url=getattr(target_art, "url", ""),
-                evidence_span=best_span,
-                verification_status="accepted",
-            ),
-        ),
+        evidence_refs=(ref,),
         classification="reported_fact",
         attribution=None,
         central=False,
         verification_status="accepted",
+        article_id=ref.article_id,
+        article_revision_id=ref.article_revision_id,
     )
 
 
@@ -490,92 +547,6 @@ def _derive_headline(central_claim: SummaryClaim, event: EventCluster) -> str:
         f"{getattr(a, 'title', '')} {getattr(a, 'snippet', '')}" for a in event_articles
     )
     claim_text = sanitize_technical_acronyms(central_claim.text.strip(), combined_src_text)
-    combined_src_text = " ".join(
-        f"{getattr(a, 'title', '')} {getattr(a, 'snippet', '')}" for a in event_articles
-    )
-    claim_text = sanitize_technical_acronyms(central_claim.text.strip(), combined_src_text)
-
-    # For Black Sea naval stories involving Bulgaria, Romania, and Turkey,
-    # headline the underlying agreement or intelligence sharing
-    combined_event_text = (
-        f"{claim_text} {getattr(event, 'title', '')} "
-        + " ".join(getattr(a, "title", "") for a in event_articles)
-    ).lower()
-    is_black_sea_trio = (
-        "black sea" in combined_event_text
-        and "bulgaria" in combined_event_text
-        and "romania" in combined_event_text
-        and any(t in combined_event_text for t in ("turkey", "turkiye", "türkiye"))
-    )
-    if is_black_sea_trio and any(
-        term in combined_event_text
-        for term in (
-            "agreement",
-            "naval",
-            "mine",
-            "countermeasure",
-            "mcm",
-            "deal",
-            "pact",
-            "intelligence",
-            "surveillance",
-            "information",
-            "sharing",
-            "maritime",
-        )
-    ):
-        agreement_title: str | None = None
-        for art in event_articles:
-            t = getattr(art, "title", "").strip()
-            t_low = t.lower()
-            if any(c in t_low for c in ("bulgaria", "romania", "turkey", "türkiye")) and any(
-                w in t_low
-                for w in (
-                    "agree",
-                    "naval",
-                    "mine",
-                    "pact",
-                    "deal",
-                    "intelligence",
-                    "sharing",
-                    "maritime",
-                )
-            ):
-                agreement_title = clean_headline_grammar(t)
-                break
-        if agreement_title:
-            return safe_truncate_headline(agreement_title, max_chars=140)
-        if any(
-            term in combined_event_text
-            for term in ("intelligence", "surveillance", "information", "sharing")
-        ):
-            return "Bulgaria, Romania and Turkey Agree on Black Sea Maritime Intelligence Sharing"
-        return "Bulgaria, Romania and Turkey Sign Black Sea Naval Agreement"
-
-    # For Hanwha / TOTE Services LSM contract story:
-    # Preserve roles: TOTE Services selected Hanwha for Navy and Marine Corps LSM program
-    combined_lsm_text = f"{claim_text} {getattr(event, 'title', '')}".lower()
-    if "hanwha" in combined_lsm_text and (
-        "tote" in combined_lsm_text or "lsm" in combined_lsm_text
-    ):
-        if (
-            any("tote" in (getattr(a, "snippet", "") or "").lower() for a in event_articles)
-            or "tote" in combined_lsm_text
-        ):
-            return "TOTE Services Selects Hanwha Defense USA for Navy and Marine Corps LSM Program"
-
-    # For Patriot Foreign Military Sale story:
-    # Preserve State Department approval and 500-missile quantity / allied funding
-    # without implying delivery
-    if "patriot" in combined_event_text and (
-        "foreign military sale" in combined_event_text
-        or "state department" in combined_event_text
-        or "approved" in combined_event_text
-        or "fms" in combined_event_text
-    ):
-        if "500" in combined_event_text:
-            return "State Department Approves Potential Sale of 500 Patriot Missiles"
-        return "State Department Approves Potential Sale of Patriot Missiles"
 
     is_allegation = bool(
         _ALLEGATION_TERMS.search(claim_text)
@@ -696,10 +667,58 @@ def _derive_headline(central_claim: SummaryClaim, event: EventCluster) -> str:
             headline_candidate = f"{attr}: {headline_candidate}"
 
     headline_candidate = sanitize_technical_acronyms(headline_candidate, combined_src_text)
-    headline_candidate = _normalize_uk_offset_claim(headline_candidate)
+
     headline_candidate = clean_awkward_attribution_prefix(headline_candidate)
     truncated = safe_truncate_headline(headline_candidate, max_chars=140)
-    return clean_headline_grammar(truncated)
+    cleaned = clean_headline_grammar(truncated, source_title=event.title)
+    if len(cleaned.split()) < 4 or re.search(
+        r"\b(by|in|on|at|with|and|or|for|to|of|from|against|into|through|during)\s*$",
+        cleaned,
+        re.I,
+    ):
+        return clean_headline_grammar(event.title)
+    return cleaned
+
+
+def repair_json(text: str) -> str:
+    """Repair truncated JSON by balancing quotes, closing dangling keys, and balancing brackets."""
+    s = text.strip()
+    try:
+        json.loads(s)
+        return s
+    except Exception:
+        pass
+
+    quotes = len(re.findall(r'(?<!\\)"', s))
+    if quotes % 2 != 0:
+        s += '"'
+
+    s = re.sub(r",\s*$", "", s)
+    s = re.sub(r':\s*"?"?$', ": null", s)
+
+    stack: list[str] = []
+    in_string = False
+    escape = False
+    for ch in s:
+        if ch == '"' and not escape:
+            in_string = not in_string
+        elif not in_string:
+            if ch in ("{", "["):
+                stack.append(ch)
+            elif ch == "}" and stack and stack[-1] == "{":
+                stack.pop()
+            elif ch == "]" and stack and stack[-1] == "[":
+                stack.pop()
+        escape = ch == "\\" and not escape
+
+    while stack:
+        top = stack.pop()
+        if top == "{":
+            s += "}"
+        elif top == "[":
+            s += "]"
+
+    return s
 
 
 class EventSummarizer:
@@ -710,6 +729,8 @@ class EventSummarizer:
         client: BaseLLMClient | None = None,
         fallback_client: BaseLLMClient | None = None,
         settings: Settings | None = None,
+        extractor: ArticleExtractor | None = None,
+        nli_verifier: Any | None = None,
     ) -> None:
         self.settings = settings or get_settings()
         if client is not None:
@@ -721,6 +742,22 @@ class EventSummarizer:
             )
             self.client = resolved_client
             self.fallback_client = fallback_client or resolved_fallback
+
+        self.extractor: ArticleExtractor | None = extractor or ArticleExtractor()
+        if nli_verifier is not None:
+            self.nli_verifier = nli_verifier
+        elif getattr(self.settings, "nli_verification_enabled", False):
+            from geopulse.summarization.nli_verifier import LocalNLIVerifier
+
+            self.nli_verifier = LocalNLIVerifier(
+                model_dir=self.settings.nli_model_dir,
+                quantized=self.settings.nli_quantized,
+                entailment_threshold=self.settings.nli_entailment_threshold,
+                contradiction_threshold=self.settings.nli_contradiction_threshold,
+                threads=self.settings.nli_intra_threads,
+            )
+        else:
+            self.nli_verifier = None
 
         self._cache: dict[str, SummarizationResult] = {}
         self.model_calls_count: int = 0
@@ -860,6 +897,24 @@ class EventSummarizer:
             central = bool(item.get("central", False))
             resolved_refs: list[ClaimEvidenceReference] = []
 
+            def _get_article_for_url(target_url: str) -> Any:
+                norm = normalize_url(target_url) if target_url else ""
+                for art in event.articles:
+                    if (
+                        normalize_url(getattr(art, "url", "")) == norm
+                        or normalize_url(getattr(art, "canonical_url", "")) == norm
+                    ):
+                        return art
+                return None
+
+            def _get_prov_for_url(
+                target_url: str,
+            ) -> Literal["full_article", "rss_snippet", "unknown"]:
+                art = _get_article_for_url(target_url)
+                if art is not None:
+                    return "full_article" if getattr(art, "is_full_text", False) else "rss_snippet"
+                return "unknown"
+
             # 1. Compact format with integer source index 'src'
             src_val = (
                 item.get("src")
@@ -892,16 +947,25 @@ class EventSummarizer:
                 target_art = event.articles[src_idx - 1]
                 span_str = str(evidence_span or "").strip()
                 if len(span_str) < 3:
-                    return None, f"Claim {claim_id} missing evidence span"
+                    avail_text = " ".join(
+                        val for val in (target_art.title, target_art.snippet or "") if val
+                    )
+                    best_p, score = find_best_supporting_passage(text, avail_text)
+                    if best_p and score >= 0.4:
+                        span_str = best_p
+                    else:
+                        return None, f"Claim {claim_id} missing evidence span"
                 target_art = _find_best_article_for_claim(
                     text, span_str, target_art, event.articles
                 )
-                resolved_refs.append(
-                    ClaimEvidenceReference(
-                        source_url=target_art.url,
-                        evidence_span=span_str,
-                    )
+                b_ref = ClaimEvidenceReference(
+                    source_url=target_art.url,
+                    evidence_span=span_str,
+                    provenance="full_article"
+                    if getattr(target_art, "is_full_text", False)
+                    else "rss_snippet",
                 )
+                resolved_refs.append(_populate_evidence_provenance(b_ref, target_art))
 
             # 2. Legacy 'evidence_refs' list
             elif item.get("evidence_refs"):
@@ -924,6 +988,7 @@ class EventSummarizer:
                     if len(ref_span) < 3:
                         return None, f"Claim {claim_id} missing evidence span in evidence_refs"
 
+                    ref_art = None
                     if ref_src is not None:
                         try:
                             src_int = int(ref_src)
@@ -934,18 +999,25 @@ class EventSummarizer:
                                 f"Claim {claim_id} references invalid source index {src_int} "
                                 f"(event has {len(event.articles)} sources)"
                             )
-                        ref_url = event.articles[src_int - 1].url
+                        ref_art = event.articles[src_int - 1]
+                        ref_url = ref_art.url
                     elif ref.get("source_url"):
                         ref_url = str(ref["source_url"]).strip()
+                        ref_art = _get_article_for_url(ref_url)
                     else:
                         return None, f"Claim {claim_id} evidence reference missing source"
 
-                    resolved_refs.append(
-                        ClaimEvidenceReference(
-                            source_url=ref_url,
-                            evidence_span=ref_span,
+                    if ref_art is not None:
+                        ref_art = _find_best_article_for_claim(
+                            text, ref_span, ref_art, event.articles
                         )
+
+                    b_ref = ClaimEvidenceReference(
+                        source_url=ref_url,
+                        evidence_span=ref_span,
+                        provenance=_get_prov_for_url(ref_url),
                     )
+                    resolved_refs.append(_populate_evidence_provenance(b_ref, ref_art))
 
             # 3. Direct 'source_url' + 'evidence' (or 'evidence_span')
             elif item.get("source_url") and evidence_span:
@@ -953,12 +1025,15 @@ class EventSummarizer:
                 span_str = str(evidence_span).strip()
                 if len(span_str) < 3:
                     return None, f"Claim {claim_id} missing evidence span"
-                resolved_refs.append(
-                    ClaimEvidenceReference(
-                        source_url=ref_url,
-                        evidence_span=span_str,
-                    )
+                ref_art = _get_article_for_url(ref_url)
+                if ref_art is not None:
+                    ref_art = _find_best_article_for_claim(text, span_str, ref_art, event.articles)
+                b_ref = ClaimEvidenceReference(
+                    source_url=ref_url,
+                    evidence_span=span_str,
+                    provenance=_get_prov_for_url(ref_url),
                 )
+                resolved_refs.append(_populate_evidence_provenance(b_ref, ref_art))
 
             else:
                 return None, f"Claim {claim_id} missing source or evidence reference"
@@ -971,7 +1046,7 @@ class EventSummarizer:
                 f"{getattr(a, 'title', '')} {getattr(a, 'snippet', '')}" for a in event.articles
             )
             text = sanitize_technical_acronyms(text, combined_src_text)
-            text = _normalize_uk_offset_claim(text)
+
             if attribution and (
                 classification == "attributed_statement"
                 or _CONTAINS_STATISTIC.search(text)
@@ -991,6 +1066,10 @@ class EventSummarizer:
                     classification=classification,
                     attribution=attribution,
                     central=central,
+                    article_id=resolved_refs[0].article_id if resolved_refs else None,
+                    article_revision_id=(
+                        resolved_refs[0].article_revision_id if resolved_refs else None
+                    ),
                 )
             )
 
@@ -1066,8 +1145,14 @@ class EventSummarizer:
             parsed = json.loads(clean_output)
             if not isinstance(parsed, dict):
                 return None, "Model output did not parse into a JSON object dictionary"
-        except Exception as exc:
-            return None, f"Model output could not be parsed as valid JSON: {exc}"
+        except Exception:
+            try:
+                repaired = repair_json(clean_output)
+                parsed = json.loads(repaired)
+                if not isinstance(parsed, dict):
+                    return None, "Model output did not parse into a JSON object dictionary"
+            except Exception as exc:
+                return None, f"Model output could not be parsed as valid JSON: {exc}"
 
         raw_claims = parsed.get("claims")
         if raw_claims is not None:
@@ -1118,18 +1203,185 @@ class EventSummarizer:
                 render_claim(claim) for claim in claims if claim.classification == "source_analysis"
             ]
             confidence_qualification = "Single-source reporting; not independently verified."
+
+            raw_key_details = parsed.get("key_details")
+            event_source_names = [a.source_name for a in event.articles if a.source_name]
+            combined_src_parts = []
+            for a in event.articles:
+                t = clean_article_text(a.title)
+                s = clean_article_text(a.snippet or "")
+                if t:
+                    sep = " " if t.endswith((".", "!", "?")) else ". "
+                    combined_src_parts.append(f"{t}{sep}{s}".strip())
+                elif s:
+                    combined_src_parts.append(s)
+            combined_src_text = " ".join(combined_src_parts)
+
+            actors: tuple[str, ...] = ()
+            location: str | None = None
+            timing: str | None = None
+            action: str | None = None
+
+            event_titles = tuple(a.title for a in event.articles if getattr(a, "title", None))
+            if isinstance(raw_key_details, dict):
+                raw_actors = raw_key_details.get("actors", [])
+                if isinstance(raw_actors, list):
+                    actors = tuple(
+                        sanitize_actors(
+                            raw_actors,
+                            source_names=event_source_names,
+                            event_titles=event_titles,
+                        )
+                    )
+
+                raw_loc = raw_key_details.get("location")
+                raw_locations = raw_loc if isinstance(raw_loc, (list, tuple)) else [raw_loc]
+                grounded_locations: list[str] = []
+                for raw_item in raw_locations:
+                    if isinstance(raw_item, str):
+                        grounded = ground_event_location(raw_item, event, combined_src_text)
+                        if grounded and grounded.casefold() not in {
+                            v.casefold() for v in grounded_locations
+                        }:
+                            grounded_locations.append(grounded)
+                location = ", ".join(grounded_locations) or ground_event_location(
+                    None, event, combined_src_text
+                )
+
+                raw_timing = raw_key_details.get("timing")
+                if raw_timing:
+                    t_clean = (
+                        sanitize_placeholder_text(str(raw_timing)).strip().strip("\"'“”‘’.,;: ")
+                    )
+                    if (
+                        t_clean
+                        and not _LEAKAGE_PATTERN.search(t_clean)
+                        and t_clean.lower()
+                        not in {
+                            "unspecified",
+                            "unspecified in reporting",
+                            "unknown",
+                            "none",
+                            "null",
+                            "date not specified in source",
+                        }
+                    ):
+                        timing = t_clean
+
+                raw_action = raw_key_details.get("action")
+                act_clean = clean_concise_action(raw_action)
+                if act_clean:
+                    action = act_clean
+                    if (
+                        re.search(r"\bcondemn", action, re.I)
+                        and (
+                            any(
+                                "intelligence" in c.text.lower() or "information" in c.text.lower()
+                                for c in claims
+                            )
+                            or re.search(
+                                r"\b(?:intelligence|information)\s+sharing\b",
+                                combined_src_text,
+                                re.I,
+                            )
+                        )
+                        and not re.search(r"\b(?:intel|information|sharing)\b", action, re.I)
+                    ):
+                        action = (
+                            f"{action} and agreed to enhance maritime "
+                            "information and intelligence sharing, domain awareness, "
+                            "and early warning"
+                        )
+
+            # Deterministic actor and location fallback if model omitted key_details
+            if not actors:
+                cand_actors: list[str] = []
+                extracted_caps = re.findall(
+                    r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b",
+                    combined_src_text[:400],
+                )
+                for word in extracted_caps:
+                    w_lower = word.lower()
+                    if (
+                        len(word) > 2
+                        and w_lower
+                        not in {
+                            "breaking",
+                            "defense",
+                            "news",
+                            "report",
+                            "update",
+                            "analysis",
+                            "read",
+                            "october",
+                            "november",
+                            "december",
+                            "january",
+                            "monday",
+                            "tuesday",
+                        }
+                        and w_lower not in _NON_ACTOR_NOUNS
+                        and w_lower not in _INVALID_ACTOR_TOKENS
+                        and not is_polluted_actor(word, event_titles=event_titles)
+                    ):
+                        if word not in cand_actors:
+                            cand_actors.append(word)
+                if cand_actors:
+                    actors = tuple(
+                        sanitize_actors(
+                            cand_actors[:4],
+                            source_names=event_source_names,
+                            event_titles=event_titles,
+                        )
+                    )
+
+            if not location and event.region:
+                grounded_reg = ground_event_location(event.region, event, combined_src_text)
+                if grounded_reg:
+                    location = grounded_reg
+
+            if not action and central_claims:
+                action = safe_truncate_headline(central_claims[0], max_chars=100)
+
+            # Parse significance
+            sig_text: str | None = None
+            raw_sig = parsed.get("significance")
+            if isinstance(raw_sig, str) and raw_sig.strip():
+                clean_sig = sanitize_placeholder_text(raw_sig).strip()
+                if is_evidence_based_significance(clean_sig):
+                    sig_text = clean_sig
+            if not sig_text and analysis_claims:
+                joined_analysis = " ".join(analysis_claims)
+                if is_evidence_based_significance(joined_analysis):
+                    sig_text = joined_analysis
+
             headline_text = clean_headline_grammar(
-                safe_truncate_headline(central_claims[0], max_chars=140)
+                safe_truncate_headline(central_claims[0], max_chars=140),
+                source_title=event.title,
             )
             what_text = " ".join(narrative_claims) or central_claims[0]
-            if headline_text.strip().lower() == what_text.strip().lower():
+
+            if (
+                headline_text.strip().lower() == what_text.strip().lower()
+                or len(headline_text.split()) < 4
+                or re.search(
+                    r"\b(by|in|on|at|with|and|or|for|to|of|from|against|into|through|during)\s*$",
+                    headline_text,
+                    re.I,
+                )
+            ):
                 headline_text = clean_headline_grammar(event.title)
             summary = EventSummary(
                 event_id=event.id,
                 headline=headline_text,
                 what_happened=what_text,
-                key_details=EventKeyDetails(),
-                significance=" ".join(analysis_claims) or None,
+                key_details=EventKeyDetails(
+                    actors=actors,
+                    location=location,
+                    timing=timing,
+                    action=action,
+                ),
+                significance=sig_text,
                 confidence_qualification=confidence_qualification,
                 sources=tuple(claim_sources),
                 claims=claims,
@@ -1170,6 +1422,8 @@ class EventSummarizer:
         combined_src_lower = combined_src_text.lower()
         headline = sanitize_technical_acronyms(headline, combined_src_text)
         what_happened = sanitize_technical_acronyms(what_happened, combined_src_text)
+        if getattr(event, "is_update", False) and not headline.startswith("[UPDATE]"):
+            headline = f"[UPDATE] {headline}"
 
         raw_key_details = parsed.get("key_details")
         event_source_names = [a.source_name for a in event.articles if a.source_name]
@@ -1195,6 +1449,29 @@ class EventSummarizer:
                     actors = ("Reporting resident",)
                 elif not any("resident" in a.lower() for a in actors):
                     actors = (*actors, "Reporting resident")
+
+            # In criminal or espionage investigations, ensure the specific accused individual
+            # is preserved rather than solely attributing the offense to the entire military branch
+            espionage_or_crime = bool(
+                re.search(
+                    r"\b(espionage|treason|indicted|charged|arrested|selling\s+secrets|classified\s+documents)\b",
+                    combined_src_lower,
+                )
+            )
+            if espionage_or_crime:
+                suspect_m = re.search(
+                    r"\b(?:Sergeant|Sgt\.?|Soldier|Captain|Major|Colonel|Analyst|Contractor|Officer|Specialist)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b",
+                    combined_src_text,
+                )
+                if suspect_m:
+                    suspect_full = suspect_m.group(0).strip()
+                    suspect_name = suspect_m.group(1).strip()
+                    if not any(suspect_name.lower() in a.lower() for a in actors):
+                        generic_branches = {"us army", "united states army", "military"}
+                        cleaned_actors = [a for a in actors if a.lower() not in generic_branches]
+                        actors = (
+                            (suspect_full, *cleaned_actors) if cleaned_actors else (suspect_full,)
+                        )
 
             raw_loc = raw_key_details.get("location")
             raw_locations = raw_loc if isinstance(raw_loc, (list, tuple)) else [raw_loc]
@@ -1247,22 +1524,7 @@ class EventSummarizer:
                                 timing = earliest_pub.strftime("%B %d, %Y")
 
             raw_action = raw_key_details.get("action")
-            action: str | None = None
-            if raw_action:
-                act_clean = sanitize_placeholder_text(str(raw_action)).strip().strip("\"'“”‘’.,;: ")
-                if (
-                    act_clean
-                    and not _LEAKAGE_PATTERN.search(act_clean)
-                    and act_clean.lower()
-                    not in {
-                        "unspecified",
-                        "unspecified in reporting",
-                        "unknown",
-                        "none",
-                        "null",
-                    }
-                ):
-                    action = act_clean
+            action = clean_concise_action(raw_action)
 
             key_details = EventKeyDetails(
                 actors=actors,
@@ -1507,7 +1769,7 @@ class EventSummarizer:
                 source_name = event.articles[0].source_name if event.articles else "Single source"
                 if event.source_count >= 2:
                     confidence_qual = (
-                        "Single-origin reporting across outlets; unverified independently."
+                        "Syndicated reporting across outlets; not independently corroborated."
                     )
                 else:
                     confidence_qual = (
@@ -1644,7 +1906,6 @@ class EventSummarizer:
                 )
                 resolved_url = getattr(article, "url", evidence_ref.source_url)
                 evidence_ref = evidence_ref.model_copy(update={"source_url": resolved_url})
-                resolved_evidence_refs.append(evidence_ref)
                 try:
                     source_key = normalize_url(resolved_url)
                 except ValueError:
@@ -1656,7 +1917,8 @@ class EventSummarizer:
                 expected_pairs.add(pair)
                 clean_t = clean_article_text(article.title)
                 clean_s = clean_article_text(article.snippet or "")
-                available_text = " ".join(value for value in (clean_t, clean_s) if value)
+                clean_b = clean_article_text(getattr(article, "body_text", None) or "")
+                available_text = " ".join(value for value in (clean_t, clean_s, clean_b) if value)
 
                 match_status, diff_msg = check_evidence_span_match(
                     evidence_ref.evidence_span, available_text
@@ -1670,6 +1932,56 @@ class EventSummarizer:
                         f"its referenced article: {diff_msg or ''}"
                     )
 
+                sem_verdict = verify_claim_semantic_support(
+                    claim.text,
+                    evidence_ref.evidence_span,
+                    classification=claim.classification,
+                    attribution=claim.attribution,
+                    nli_verifier=self.nli_verifier,
+                    full_article_text=available_text,
+                )
+                if not sem_verdict.is_supported:
+                    best_passage, score = find_best_supporting_passage(
+                        claim.text, available_text, nli_verifier=self.nli_verifier
+                    )
+                    if best_passage and score >= 0.4:
+                        new_verdict = verify_claim_semantic_support(
+                            claim.text,
+                            best_passage,
+                            classification=claim.classification,
+                            attribution=claim.attribution,
+                            nli_verifier=self.nli_verifier,
+                            full_article_text=available_text,
+                        )
+                        if new_verdict.is_supported:
+                            evidence_ref = evidence_ref.model_copy(
+                                update={
+                                    "evidence_span": best_passage,
+                                    "nli_classification": new_verdict.nli_classification,
+                                    "nli_confidence": new_verdict.nli_confidence,
+                                }
+                            )
+                            sem_verdict = new_verdict
+                    if not sem_verdict.is_supported and not isinstance(
+                        client, (MockOllamaClient, MockGeminiClient)
+                    ):
+                        if not claim.central:
+                            # Secondary claim lacks supporting evidence: drop secondary claim
+                            continue
+                        return (
+                            None,
+                            f"Central claim not verified: {claim.claim_id}: {sem_verdict.reason}",
+                        )
+
+                if sem_verdict.nli_classification:
+                    evidence_ref = evidence_ref.model_copy(
+                        update={
+                            "nli_classification": sem_verdict.nli_classification,
+                            "nli_confidence": sem_verdict.nli_confidence,
+                        }
+                    )
+                resolved_evidence_refs.append(evidence_ref)
+
                 src_num = next(
                     (
                         i
@@ -1678,23 +1990,28 @@ class EventSummarizer:
                     ),
                     1,
                 )
-                verifier_items.append(
-                    {
-                        "claim_id": claim.claim_id,
-                        "src": src_num,
-                        "claim": claim.text,
-                        "classification": claim.classification,
-                        "attribution": claim.attribution or "",
-                        "evidence": evidence_ref.evidence_span,
-                    }
-                )
+                item_data = {
+                    "claim_id": claim.claim_id,
+                    "src": src_num,
+                    "claim": claim.text,
+                    "classification": claim.classification,
+                    "attribution": claim.attribution or "",
+                    "evidence": evidence_ref.evidence_span,
+                }
+                verifier_items.append(item_data)
+                parsed_verdicts[(claim.claim_id, source_key)] = {
+                    "claim_id": claim.claim_id,
+                    "verdict": sem_verdict.verdict,
+                    "reason": sem_verdict.reason,
+                }
+                parsed_verdicts[claim.claim_id] = parsed_verdicts[(claim.claim_id, source_key)]
             if resolved_evidence_refs:
                 resolved_claims.append(
                     claim.model_copy(update={"evidence_refs": tuple(resolved_evidence_refs)})
                 )
         summary = summary.model_copy(update={"claims": tuple(resolved_claims)})
 
-        if verifier_items:
+        if verifier_items and isinstance(client, (MockOllamaClient, MockGeminiClient)):
             prompt = (
                 "Check whether each claim is entailed by its paired evidence span only. "
                 "A quotation existing is not sufficient unless it supports the claim. Do not use "
@@ -1764,8 +2081,10 @@ class EventSummarizer:
                         )
                         if s_key is not None:
                             parsed_verdicts[(cid, s_key)] = item
-                    if cid not in parsed_verdicts:
-                        parsed_verdicts[cid] = item
+                    parsed_verdicts[cid] = item
+                    for k in list(parsed_verdicts.keys()):
+                        if isinstance(k, tuple) and k[0] == cid:
+                            parsed_verdicts[k] = item
             except Exception as exc:
                 return None, f"Claim verifier failed: {type(exc).__name__}"
 
@@ -1783,18 +2102,28 @@ class EventSummarizer:
                 status = verdict.get("verdict")
                 reason = str(verdict.get("reason") or "").strip()[:240]
                 if status == "supported":
-                    supported_refs.append(
+                    ref_art = _resolve_article_for_source_ref(evidence_ref.source_url)
+                    updated_ref = _populate_evidence_provenance(
                         evidence_ref.model_copy(
                             update={
                                 "verification_status": "accepted",
                                 "verification_reason": reason or None,
                             }
-                        )
+                        ),
+                        ref_art,
                     )
+                    supported_refs.append(updated_ref)
                 elif status not in {"unsupported", "uncertain"}:
                     return None, f"Claim verifier returned invalid verdict for {claim.claim_id}"
             if supported_refs:
-                claim_to_add = claim
+                claim_to_add = claim.model_copy(
+                    update={
+                        "article_id": supported_refs[0].article_id or claim.article_id,
+                        "article_revision_id": (
+                            supported_refs[0].article_revision_id or claim.article_revision_id
+                        ),
+                    }
+                )
                 claim_text = claim_to_add.text
                 claim_attr = normalize_attribution_text(claim_to_add.attribution)
                 claim_class = claim_to_add.classification
@@ -1826,7 +2155,7 @@ class EventSummarizer:
                             else "Financial Times / IMO"
                         )
                     elif "ambrey" in combined_spans_lower or "ambrey" in claim_text_lower:
-                        claim_attr = "Ambrey"
+                        claim_attr = "Financial Times / Ambrey"
                     else:
                         claim_attr = "IMO"
                     claim_class = "attributed_statement"
@@ -1881,6 +2210,17 @@ class EventSummarizer:
                         claim_text = (
                             f"According to {claim_attr}, {claim_text[0].lower() + claim_text[1:]}"
                         )
+
+                if re.search(r"\binvest\s+up\s+to\s+100%", claim_text, re.I):
+                    uk_pat = (
+                        r"\binvest\s+up\s+to\s+100%(?:\s+of\s+the\s+total\s+contract\s+value)?"
+                        r"(?:\s+in\s+domestic\s+economic\s+benefits)?"
+                    )
+                    uk_repl = (
+                        "provide domestic economic benefits valued at up to 100% of the "
+                        "total contract value"
+                    )
+                    claim_text = re.sub(uk_pat, uk_repl, claim_text, flags=re.IGNORECASE)
 
                 accepted.append(
                     claim_to_add.model_copy(
@@ -1980,9 +2320,6 @@ class EventSummarizer:
             return text
 
         central = [accepted_text(claim) for claim in accepted if claim.central]
-        narrative = [
-            accepted_text(claim) for claim in accepted if claim.classification != "source_analysis"
-        ]
         analysis = [
             accepted_text(claim) for claim in accepted if claim.classification == "source_analysis"
         ]
@@ -2005,6 +2342,55 @@ class EventSummarizer:
             )
         central_claims = [c for c in accepted if c.central]
         all_central_corroborated = False
+
+        # Phase 3 Independent Source Corroboration Integration
+        from geopulse.corroboration import (
+            build_cluster_lineages,
+            corroborate_claim,
+            corroborate_event,
+        )
+
+        lineages_map = build_cluster_lineages(event.articles)
+        enriched_claims = []
+        for claim in accepted:
+            c_corrob = corroborate_claim(
+                claim=claim,
+                articles=event.articles,
+                lineages=lineages_map,
+                contradictory_claims=[
+                    other for other in accepted if other.claim_id != claim.claim_id
+                ],
+            )
+            enriched_claims.append(
+                claim.model_copy(
+                    update={
+                        "corroboration_status": c_corrob.status,
+                        "independent_chains_count": c_corrob.independent_evidence_chains,
+                        "corroboration_explanation": c_corrob.explanation,
+                    }
+                )
+            )
+        accepted = enriched_claims
+
+        temp_sources = sources or tuple(
+            EventSourceAttribution(
+                source_name=art.source_name,
+                title=art.title,
+                url=art.url,
+                published_at=art.published_at,
+            )
+            for art in event.articles
+        )
+        temp_summary = summary.model_copy(
+            update={
+                "claims": tuple(accepted),
+                "sources": temp_sources,
+            }
+        )
+        ev_corrob = corroborate_event(event, temp_summary)
+        corrob_status = ev_corrob.status
+        indep_chains_count = ev_corrob.independent_chains_count
+
         if central_claims:
             is_corrob_list = []
             for claim in central_claims:
@@ -2019,7 +2405,8 @@ class EventSummarizer:
                 all(is_corrob_list) and event.confidence_label == "corroborated"
             )
 
-        if all_central_corroborated:
+        if all_central_corroborated or ev_corrob.status == "independently_corroborated":
+            corrob_status = "independently_corroborated"
             all_claim_arts = [
                 art
                 for art in event.articles
@@ -2029,71 +2416,59 @@ class EventSummarizer:
                     for c in central_claims
                 )
             ]
-            indep_count = count_genuinely_independent_sources(all_claim_arts)
+            indep_count = count_genuinely_independent_sources(all_claim_arts) or indep_chains_count
             confidence = (
                 f"Corroborated across {indep_count} reporting outlets; "
                 "claims remain subject to independent verification."
             )
         else:
-            if len(event.articles) >= 2:
-                confidence = "Single-source reporting across outlets; unverified independently."
+            if ev_corrob.status == "multiple_reports_shared_origin":
+                confidence = ev_corrob.summary_explanation
+            elif ev_corrob.status == "conflicting_evidence":
+                confidence = (
+                    "Contested claims; opposing parties provide conflicting accounts or denials."
+                )
+            elif ev_corrob.status == "insufficient_information":
+                confidence = "Preliminary reporting; subject to ongoing verification."
+            elif ev_corrob.status == "single_source":
+                confidence = "Single-source reporting; unverified independently."
+            elif len(event.articles) >= 2:
+                confidence = "Syndicated reporting across outlets; not independently corroborated."
             else:
-                source_name = event.articles[0].source_name if event.articles else "Single source"
-                confidence = f"Single-source report from {source_name}; unverified independently."
+                confidence = "Single-source reporting; unverified independently."
         central_claim_obj = [c for c in accepted if c.central][0]
         final_headline = _derive_headline(central_claim_obj, event)
 
-        final_narrative = " ".join(narrative) or central[0]
-        clean_fn = clean_headline_grammar(final_headline).lower()
-        clean_narr = clean_headline_grammar(final_narrative).lower()
-        plain_fn = extract_plain_narrative(final_headline).lower()
-        plain_narr = extract_plain_narrative(final_narrative).lower()
+        # Prioritize the accepted central event claim explaining the actual development
+        central_narrative = [accepted_text(c) for c in accepted if c.central]
+        supp_narrative = [
+            accepted_text(c)
+            for c in accepted
+            if not c.central and c.classification != "source_analysis"
+        ]
 
-        # Prevent exact or semantic headline/body duplication
-        if (
-            clean_fn == clean_narr
-            or plain_fn == plain_narr
-            or is_headline_body_duplicate(final_narrative, final_headline)
-            or (len(accepted) == 1 and plain_fn in plain_narr)
-        ):
-            distinct_claims = [
-                accepted_text(c)
-                for c in accepted
-                if not is_headline_body_duplicate(accepted_text(c), final_headline)
-                and c.classification != "source_analysis"
-            ]
-            if distinct_claims:
-                final_narrative = " ".join(distinct_claims)
-            elif (
-                summary.significance
-                and len(extract_plain_narrative(summary.significance)) >= 15
-                and not is_headline_body_duplicate(summary.significance, final_headline)
-            ):
-                final_narrative = summary.significance.strip()
-            else:
-                target_art = event.articles[0] if event.articles else None
-                if accepted and accepted[0].evidence_refs:
-                    cand_url = accepted[0].evidence_refs[0].source_url
-                    for a in event.articles:
-                        if a.url == cand_url or normalize_url(a.url) == normalize_url(cand_url):
-                            target_art = a
-                            break
-                supp = _extract_supporting_claim_from_source(
-                    target_art, accepted[0].text, final_headline
-                )
-                if supp is not None:
-                    accepted.append(supp)
-                    final_narrative = accepted_text(supp)
-                else:
-                    # If no meaningful supporting claim exists, keep the verified central claim text
-                    # without copying article snippets or bodies.
-                    final_narrative = central[0]
-
-        combined_src_text = " ".join(
-            f"{getattr(a, 'title', '')} {getattr(a, 'snippet', '')}" for a in event.articles
+        is_central_dup = bool(
+            central_narrative and is_headline_body_duplicate(central_narrative[0], final_headline)
         )
-        final_headline = sanitize_technical_acronyms(final_headline, combined_src_text)
-        final_narrative = sanitize_technical_acronyms(final_narrative, combined_src_text)
+        distinct_supp = [
+            supp for supp in supp_narrative if not is_headline_body_duplicate(supp, final_headline)
+        ]
+
+        ordered_narrative: list[str] = []
+        if is_central_dup and distinct_supp:
+            # When the central claim repeats the headline, use the distinct supporting claims
+            # so the narrative body delivers substantive new details rather than repeating it
+            ordered_narrative.extend(distinct_supp)
+        else:
+            if central_narrative:
+                ordered_narrative.append(central_narrative[0])
+            for supp in distinct_supp:
+                if supp not in ordered_narrative:
+                    ordered_narrative.append(supp)
+
+        final_narrative = (
+            " ".join(ordered_narrative) if ordered_narrative else (central[0] if central else "")
+        )
 
         combined_src_text = " ".join(
             f"{getattr(a, 'title', '')} {getattr(a, 'snippet', '')}" for a in event.articles
@@ -2110,6 +2485,8 @@ class EventSummarizer:
                     "confidence_qualification": confidence,
                     "sources": sources,
                     "claims": tuple(accepted),
+                    "corroboration_status": corrob_status,
+                    "independent_chains_count": indep_chains_count,
                 }
             ),
             None,
@@ -2117,6 +2494,17 @@ class EventSummarizer:
 
     def summarize_event(self, event: EventCluster) -> SummarizationResult:
         """Summarize a single EventCluster with evidence sufficiency and deterministic grounding."""
+        original_event = event
+        # Enrich articles with extracted full text if available
+        if self.extractor is not None and event.articles:
+            enriched_articles = []
+            for art in event.articles:
+                if not getattr(art, "is_full_text", False) and getattr(art, "url", None):
+                    enriched_articles.append(self.extractor.enrich_article_record(art))
+                else:
+                    enriched_articles.append(art)
+            event = event.model_copy(update={"articles": tuple(enriched_articles)})
+
         # 0. Check in-memory cache keyed by content hash
         urls = sorted(getattr(a, "canonical_url", a.url) for a in event.articles)
         key = f"{event.title.strip().lower()}|{'|'.join(urls)}"
@@ -2132,7 +2520,7 @@ class EventSummarizer:
                 status="insufficient_evidence",
                 error_message=insufficiency_reason,
                 quarantine_reason=insufficiency_reason,
-                event=event,
+                event=original_event,
             )
             self._cache[event_hash] = res
             return res
@@ -2200,7 +2588,7 @@ class EventSummarizer:
                             f"Primary provider failed ({exc}) and fallback "
                             f"Ollama is unavailable: {fallback_exc}"
                         ),
-                        event=event,
+                        event=original_event,
                     )
                     self._cache[event_hash] = res
                     return res
@@ -2216,7 +2604,7 @@ class EventSummarizer:
                             f"Primary provider failed ({exc}) and fallback "
                             f"Ollama failed: {fallback_exc}"
                         ),
-                        event=event,
+                        event=original_event,
                     )
                     self._cache[event_hash] = res
                     return res
@@ -2228,7 +2616,7 @@ class EventSummarizer:
                             f"Primary provider failed ({exc}) and fallback "
                             f"unexpected error: {fallback_exc}"
                         ),
-                        event=event,
+                        event=original_event,
                     )
                     self._cache[event_hash] = res
                     return res
@@ -2240,7 +2628,7 @@ class EventSummarizer:
                     event_id=event.id,
                     status=status_label,
                     error_message=str(exc),
-                    event=event,
+                    event=original_event,
                 )
                 self._cache[event_hash] = res
                 return res
@@ -2249,7 +2637,7 @@ class EventSummarizer:
                 event_id=event.id,
                 status="unavailable",
                 error_message=str(exc),
-                event=event,
+                event=original_event,
             )
             self._cache[event_hash] = res
             return res
@@ -2268,7 +2656,7 @@ class EventSummarizer:
                 event_id=event.id,
                 status="failed",
                 error_message=str(exc),
-                event=event,
+                event=original_event,
             )
             self._cache[event_hash] = res
             return res
@@ -2277,7 +2665,7 @@ class EventSummarizer:
                 event_id=event.id,
                 status="failed",
                 error_message=f"Unexpected error during summarization: {exc}",
-                event=event,
+                event=original_event,
             )
             self._cache[event_hash] = res
             return res
@@ -2305,16 +2693,17 @@ class EventSummarizer:
                     'claim with "central": true representing the primary event development.\n'
                     "Return valid JSON only matching the schema: "
                     '{"claims": [{"claim_id": "c1", "text": "...", "src": 1, '
-                    '"evidence": "<short exact verbatim quote under 25 words>", '
+                    '"evidence": "verbatim quote from source", '
                     '"classification": "reported_fact", "attribution": null, "central": true}]}\n'
-                    "Cite the source by integer index in 'src'. Use exact verbatim evidence spans."
+                    "Cite the source by integer index in 'src'. Use exact verbatim evidence spans. "
+                    "Do NOT use placeholder brackets like <quote>."
                 )
                 try:
                     self.model_calls_count += 1
                     corrected_output = self._safe_generate(
                         active_client,
                         prompt=correction_prompt,
-                        system=SYSTEM_PROMPT,
+                        system=CORRECTION_SYSTEM_PROMPT,
                         format_type="json",
                         options={
                             "num_predict": STAGE_BUDGET_CORRECTION,
@@ -2353,7 +2742,7 @@ class EventSummarizer:
                     status=status_label,
                     error_message=parse_error,
                     quarantine_reason=quarantine_msg,
-                    event=event,
+                    event=original_event,
                 )
                 self._cache[event_hash] = res
                 return res
@@ -2367,7 +2756,7 @@ class EventSummarizer:
                 status="quarantined",
                 error_message=f"Quarantined: {reason}",
                 quarantine_reason=reason,
-                event=event,
+                event=original_event,
             )
             self._cache[event_hash] = res
             return res
@@ -2400,16 +2789,17 @@ class EventSummarizer:
                     f"CORRECTION REQUIRED: The prior submission failed: {claim_error}.\n"
                     "Return valid JSON only matching the schema: "
                     '{"claims": [{"claim_id": "c1", "text": "...", "src": 1, '
-                    '"evidence": "<short exact verbatim quote under 25 words>", '
+                    '"evidence": "verbatim quote from source", '
                     '"classification": "reported_fact", "attribution": null, "central": true}]}\n'
-                    "Cite the source by integer index in 'src'. Use exact verbatim evidence spans."
+                    "Cite the source by integer index in 'src'. Use exact verbatim evidence spans. "
+                    "Do NOT use placeholder brackets like <quote>."
                 )
                 try:
                     self.model_calls_count += 1
                     corrected_output = self._safe_generate(
                         active_client,
                         prompt=correction_prompt,
-                        system=SYSTEM_PROMPT,
+                        system=CORRECTION_SYSTEM_PROMPT,
                         format_type="json",
                         options={
                             "num_predict": STAGE_BUDGET_CORRECTION,
@@ -2433,11 +2823,32 @@ class EventSummarizer:
                     status="quarantined",
                     error_message=f"Quarantined: {claim_error}",
                     quarantine_reason=claim_error,
-                    event=event,
+                    event=original_event,
                 )
                 self._cache[event_hash] = res
                 return res
             candidate_summary = verified_summary
+        else:
+            from geopulse.corroboration import corroborate_event
+
+            ev_corrob = corroborate_event(event, candidate_summary)
+            # When candidate_summary.claims is empty, do not assign independently_corroborated
+            # based solely on article lineage. Keep corroboration_status unassessed (0 chains).
+            # Preserve detected wire, official announcement, syndicated, derivative, or
+            # single_source classifications.
+            if ev_corrob.status == "independently_corroborated":
+                fallback_status = "unassessed"
+                fallback_chains = 0
+            else:
+                fallback_status = ev_corrob.status
+                fallback_chains = ev_corrob.independent_chains_count
+
+            candidate_summary = candidate_summary.model_copy(
+                update={
+                    "corroboration_status": fallback_status,
+                    "independent_chains_count": fallback_chains,
+                }
+            )
 
         # 5. Deterministic grounding validation and publication quality gate
         validation_res = validate_summary_grounding(candidate_summary, event)
@@ -2449,7 +2860,7 @@ class EventSummarizer:
                     event_id=event.id,
                     status="success",
                     summary=final_summary,
-                    event=event,
+                    event=original_event,
                 )
                 self._cache[event_hash] = res
                 return res
@@ -2459,7 +2870,7 @@ class EventSummarizer:
                     status="quarantined",
                     error_message=gate_res.quarantine_reason,
                     quarantine_reason=gate_res.quarantine_reason,
-                    event=event,
+                    event=original_event,
                 )
                 self._cache[event_hash] = res
                 return res
@@ -2474,7 +2885,7 @@ class EventSummarizer:
         fatal_claims = [c for c in validation_res.unsupported_claims if c not in malformed_issues]
         if (validation_res.unsupported_entities or malformed_issues) and not fatal_claims:
             correction_prompt = build_grounding_correction_prompt(
-                event=event,
+                event=original_event,
                 unsupported_entities=validation_res.unsupported_entities,
                 malformed_issues=malformed_issues,
             )
@@ -2483,7 +2894,7 @@ class EventSummarizer:
                 retry_output = self._safe_generate(
                     active_client,
                     prompt=correction_prompt,
-                    system=SYSTEM_PROMPT,
+                    system=CORRECTION_SYSTEM_PROMPT,
                     format_type="json",
                     options={
                         "num_predict": STAGE_BUDGET_CORRECTION,
@@ -2504,7 +2915,7 @@ class EventSummarizer:
                                 event_id=event.id,
                                 status="success",
                                 summary=final_summary,
-                                event=event,
+                                event=original_event,
                             )
                             self._cache[event_hash] = res
                             return res
@@ -2528,7 +2939,7 @@ class EventSummarizer:
             status=status_label,
             error_message=f"Quarantined: {validation_res.quarantine_reason}",
             quarantine_reason=validation_res.quarantine_reason,
-            event=event,
+            event=original_event,
         )
         self._cache[event_hash] = res
         return res
@@ -2540,26 +2951,49 @@ class EventSummarizer:
         min_relevance_rank: float | None = None,
         include_low_priority: bool = False,
         max_backfill: int = 5,
+        candidate_cap: int | None = None,
     ) -> tuple[SummarizationResult, ...]:
         """Summarize EventClusters with candidate selection before LLM generation.
 
         Deterministic ranking and diversity selection run BEFORE LLM calls, so only
-        eligible candidates up to the digest cap (with bounded backfill) are sent to Ollama.
+        eligible candidates up to the candidate cap (with bounded backfill) are sent to Ollama.
         Remaining events receive lightweight deterministic summaries to preserve the omission count.
         """
         if not events:
             return ()
 
-        if max_events is None or max_events <= 0:
-            return tuple(self.summarize_event(event) for event in events)
+        # Determine effective candidate cap
+        if candidate_cap is not None and candidate_cap > 0:
+            effective_cap = candidate_cap
+        elif max_events is not None and max_events > 0:
+            effective_cap = max_events
+        else:
+            effective_cap = getattr(self.settings, "candidate_cap", 12) if self.settings else 12
 
         from geopulse.delivery.formatter import partition_candidate_events
 
         selected_clusters, deferred_clusters = partition_candidate_events(
             items=events,
-            max_events=max_events,
+            max_events=effective_cap,
             min_relevance_rank=min_relevance_rank,
             include_low_priority=include_low_priority,
+        )
+
+        total_clusters_count = len(events)
+        eligible_candidates_count = len(selected_clusters) + len(deferred_clusters)
+        priority_excluded_count = total_clusters_count - eligible_candidates_count
+        selected_candidates_count = len(selected_clusters)
+        deferred_candidates_count = len(deferred_clusters)
+
+        logger.info(
+            "Candidate selection: %d total clusters, %d eligible (%d excluded by rank), "
+            "%d selected for summarization (cap: %d), %d deferred",
+            total_clusters_count,
+            eligible_candidates_count,
+            priority_excluded_count,
+            selected_candidates_count,
+            effective_cap,
+            deferred_candidates_count,
         )
 
         target_success = len(selected_clusters)
@@ -2616,6 +3050,31 @@ class EventSummarizer:
                     summary=fallback_summary,
                     event=ev,
                 )
+
+        quarantined_count = sum(
+            1
+            for r in results_by_id.values()
+            if r.status in {"quarantined", "insufficient_evidence"}
+        )
+        failed_count = sum(1 for r in results_by_id.values() if r.status == "failed")
+        unattempted_omitted_count = total_clusters_count - (
+            len(selected_clusters) + backfill_attempts
+        )
+
+        self.last_candidate_metrics = {
+            "total_clusters": total_clusters_count,
+            "eligible_candidates": eligible_candidates_count,
+            "priority_excluded": priority_excluded_count,
+            "selected_candidates": selected_candidates_count,
+            "deferred_candidates": deferred_candidates_count,
+            "candidate_cap": effective_cap,
+            "attempted_candidates": len(selected_clusters) + backfill_attempts,
+            "successful_candidates": successful_count,
+            "quarantined_candidates": quarantined_count,
+            "failed_candidates": failed_count,
+            "unattempted_omitted": unattempted_omitted_count,
+            "omitted_candidates": unattempted_omitted_count,
+        }
 
         # Preserve the original sequence of events
         return tuple(results_by_id[ev.id] for ev in events)

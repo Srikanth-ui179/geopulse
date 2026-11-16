@@ -15,6 +15,7 @@ class BaseClassifier(ABC):
         title: str,
         snippet: str | None = None,
         source_name: str | None = None,
+        url: str | None = None,
     ) -> ClassificationResult:
         """Classify article text into relevance status and structured topic category."""
         ...
@@ -25,4 +26,5 @@ class BaseClassifier(ABC):
             title=article.title,
             snippet=article.snippet,
             source_name=article.source_name,
+            url=getattr(article, "canonical_url", None) or getattr(article, "url", None),
         )

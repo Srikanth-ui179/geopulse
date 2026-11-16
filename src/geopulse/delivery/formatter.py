@@ -31,16 +31,27 @@ CATEGORY_LABELS: dict[TopicCategory, str] = {
     TopicCategory.TERRORISM_INSURGENCY: "⚠️ TERRORISM & INSURGENCY",
     TopicCategory.CYBER_HYBRID_WARFARE: "💻 CYBER & HYBRID WARFARE",
     TopicCategory.SECURITY_INCIDENT: "🚨 SECURITY INCIDENT",
+    TopicCategory.INTELLIGENCE_ESPIONAGE: "🕵️ INTELLIGENCE & ESPIONAGE",
+    TopicCategory.MILITARY_TECHNOLOGY: "⚙️ MILITARY TECHNOLOGY",
     TopicCategory.OTHER_GEOPOLITICAL: "🌐 GEOPOLITICAL",
     TopicCategory.UNCERTAIN: "❓ UNCERTAIN",
 }
 
 CONFIDENCE_BADGES: dict[ConfidenceLabel | str, str] = {
     "corroborated": "[CORROBORATED]",
+    "independently_corroborated": "[CORROBORATED]",
+    "Independently corroborated": "[CORROBORATED]",
     "official_announcement": "[OFFICIAL ANNOUNCEMENT]",
     "single_source": "[SINGLE SOURCE]",
+    "Single-source": "[SINGLE SOURCE]",
+    "multiple_reports_shared_origin": "[SHARED ORIGIN]",
+    "shared_origin": "[SHARED ORIGIN]",
+    "Partially corroborated": "[PARTIALLY CORROBORATED]",
+    "conflicting_evidence": "[DISPUTED]",
     "disputed": "[DISPUTED]",
+    "insufficient_information": "[PRELIMINARY]",
     "uncertain": "[PRELIMINARY]",
+    "unassessed": "[NOT ASSESSED]",
 }
 
 CATEGORY_PRIORITY: dict[TopicCategory, int] = {
@@ -48,6 +59,7 @@ CATEGORY_PRIORITY: dict[TopicCategory, int] = {
     TopicCategory.ARMED_CONFLICT: 1,
     TopicCategory.SECURITY_INCIDENT: 2,
     TopicCategory.TERRORISM_INSURGENCY: 3,
+    TopicCategory.INTELLIGENCE_ESPIONAGE: 3,
     TopicCategory.MILITARY_OPERATIONS: 4,
     TopicCategory.CYBER_HYBRID_WARFARE: 5,
     # Tier 2: Consequential diplomatic developments & strategic defence policy
@@ -55,6 +67,7 @@ CATEGORY_PRIORITY: dict[TopicCategory, int] = {
     TopicCategory.DEFENCE_POLICY: 7,
     # Tier 3: Weapons procurement & economic sanctions
     TopicCategory.WEAPONS_PROCUREMENT: 8,
+    TopicCategory.MILITARY_TECHNOLOGY: 8,
     TopicCategory.SANCTIONS: 9,
     # Tier 4: General geopolitical & uncertain
     TopicCategory.OTHER_GEOPOLITICAL: 10,
@@ -66,6 +79,15 @@ CONSEQUENTIAL_DIPLOMACY_TERMS: re.Pattern[str] = re.compile(
     r"\b(peace talks?|ceasefire|peace negotiations?|truce|armistice|peace deal|peace accord|"
     r"peace treaty|peace summit|cessation of hostilities|hostage release|prisoner exchange|"
     r"diplomatic breakthrough)\b",
+    re.I,
+)
+
+# Rhetorical or aspirational diplomacy patterns (calls for talks, urging peace).
+# These non-binding statements must not outrank active armed conflict or security incidents.
+RHETORICAL_DIPLOMACY_TERMS: re.Pattern[str] = re.compile(
+    r"\b(?:calls? for|urges?|seeking|pushes? for|mulls?|advocates?|proposes?|demands?)\s+"
+    r"(?:a\s+)?(?:the\s+)?(?:resumption of\s+)?(?:ceasefire|peace talks|peace|truce)\b|"
+    r"\b(?:calls?|urges?)\s+for\s+peace\b",
     re.I,
 )
 
@@ -162,6 +184,28 @@ def is_routine_institutional_update(category: TopicCategory | None, text: str) -
     return bool(ROUTINE_INSTITUTIONAL_PATTERNS.search(text))
 
 
+VENDOR_TACTICAL_PATTERNS: re.Pattern[str] = re.compile(
+    r"\b(?:defense company says|maker of|manufacturer says|unveils new trigger|"
+    r"smart trigger|computerized trigger|tactical accessory|rifle optic|sidearm|"
+    r"handgun|assault rifle accessory|programmed to shoot drones)\b",
+    re.I,
+)
+
+STRATEGIC_DEFENCE_INDICATORS: re.Pattern[str] = re.compile(
+    r"\b(?:awarded .*?contract|contract worth|\$[0-9]+(?:\.[0-9]+)?\s*(?:billion|million)|"
+    r"state department approved|procures? [0-9]+|fleet of|procurement program|"
+    r"frontline combat deployment|combat evaluation in ukraine|air defence battery|"
+    r"fighter jet|corvette|frigate|destroyer|nuclear submarine)\b",
+    re.I,
+)
+
+GENERIC_LIVEBLOG_PATTERNS: re.Pattern[str] = re.compile(
+    r"\b(?:latest updates|as it happened|rolling coverage|live updates|live coverage|"
+    r"what you need to know|roundup of events)\b",
+    re.I,
+)
+
+
 def compute_event_priority_rank(r: SummarizationResult | EventCluster) -> float:
     """Compute deterministic numeric priority rank for an event or summary.
 
@@ -207,8 +251,48 @@ def compute_event_priority_rank(r: SummarizationResult | EventCluster) -> float:
 
     text_to_check = " ".join(text_parts)
 
-    if cat == TopicCategory.DIPLOMACY and CONSEQUENTIAL_DIPLOMACY_TERMS.search(text_to_check):
-        return 1.5
+    # 1. Liveblog handling: prevent rolling live update threads from automatically becoming Tier 1
+    event_title = getattr(event, "title", "")
+    live_match = re.search(r"^(?:.*?war\s+)?live:\s*(.+)$", event_title, re.I)
+    is_liveblog = bool(
+        live_match
+        or any(
+            "/liveblog/" in (getattr(a, "canonical_url", None) or getattr(a, "url", "") or "")
+            for a in getattr(event, "articles", ())
+        )
+    )
+    if is_liveblog:
+        substantive_live_text = live_match.group(1).strip() if live_match else ""
+        if not substantive_live_text or GENERIC_LIVEBLOG_PATTERNS.search(substantive_live_text):
+            return 10.0
+        if CONSEQUENTIAL_DIPLOMACY_TERMS.search(substantive_live_text):
+            return 1.5
+        if re.search(
+            r"\b(peace|talks|negotiat|ceasefire|diploma|envoy|summit|treaty)\b",
+            substantive_live_text,
+            re.I,
+        ):
+            return 6.0
+        if re.search(
+            r"\b(airstrike|missile strike|shelling|casualties|killed in action|clashes erupt)\b",
+            substantive_live_text,
+            re.I,
+        ):
+            return 1.0
+        if cat == TopicCategory.ARMED_CONFLICT:
+            return 7.0
+
+    # 2. Tactical product announcements (e.g. small-arms triggers / accessories)
+    if VENDOR_TACTICAL_PATTERNS.search(text_to_check) and not STRATEGIC_DEFENCE_INDICATORS.search(
+        text_to_check
+    ):
+        return 8.8
+
+    if cat == TopicCategory.DIPLOMACY:
+        if RHETORICAL_DIPLOMACY_TERMS.search(text_to_check):
+            return 7.0
+        if CONSEQUENTIAL_DIPLOMACY_TERMS.search(text_to_check):
+            return 1.5
 
     if (
         is_historical_commemoration(cat, text_to_check)
@@ -261,19 +345,52 @@ def _sort_key(r: SummarizationResult | EventCluster) -> tuple[int, float, int, f
 
     is_analysis = 1 if getattr(event, "is_analysis", False) else 0
     cat_rank = compute_event_priority_rank(r)
-    claim_confidence = _central_claims_are_corroborated(summary) if summary else None
-    if claim_confidence and summary and "single-source" in summary.confidence_qualification.lower():
-        claim_confidence = False
-    is_corroborated = (
-        claim_confidence
-        if claim_confidence is not None
-        else getattr(event, "confidence_label", None) == "corroborated"
+    corrob_status = getattr(summary, "corroboration_status", None) or getattr(
+        event, "corroboration_status", None
     )
+    if corrob_status is not None:
+        c_status_norm = str(corrob_status).strip().lower()
+    else:
+        c_status_norm = "unassessed"
+
+    if c_status_norm == "independently_corroborated":
+        is_corroborated = True
+    elif c_status_norm in (
+        "unassessed",
+        "single_source",
+        "multiple_reports_shared_origin",
+        "conflicting_evidence",
+        "insufficient_information",
+        "none",
+        "null",
+        "",
+    ):
+        is_corroborated = False
+    else:
+        claim_confidence = _central_claims_are_corroborated(summary) if summary else None
+        if (
+            claim_confidence
+            and summary
+            and "single-source" in summary.confidence_qualification.lower()
+        ):
+            claim_confidence = False
+        is_corroborated = (
+            claim_confidence
+            if claim_confidence is not None
+            else getattr(event, "confidence_label", None) == "corroborated"
+        )
     corrob_rank = 0 if is_corroborated else 1
+    articles = getattr(event, "articles", ())
+    has_full_text = any(
+        getattr(a, "is_full_text", False) and getattr(a, "body_text", None) for a in articles
+    )
+    src_diversity = getattr(event, "source_count", 1) or 1
+    evidence_score = (1.0 if has_full_text else 0.0) + min(1.0, 0.5 * (src_diversity - 1))
+
     last_dt = getattr(event, "last_seen_at", None) or getattr(event, "published_at", None)
     ts = -last_dt.timestamp() if last_dt else 0.0
     tie_breaker = getattr(event, "title", "") or (summary.headline if summary else "") or ""
-    return (is_analysis, cat_rank, corrob_rank, ts, tie_breaker)
+    return (is_analysis, cat_rank, corrob_rank, -evidence_score, ts, tie_breaker)
 
 
 # Official government/ministry source indicators
@@ -413,12 +530,16 @@ def partition_candidate_events(
 
         cat_count = category_counts.get(cat, 0)
         src_count = source_counts.get(primary_source, 0)
+        max_per_tier1_category = max(4, effective_cap // 2)
 
-        # Tier 1 events are protected and never suppressed by diversity caps
+        # Tier 1 events prioritize high-severity developments while preserving category diversity
         if is_tier_one:
-            selected.append(r)
-            category_counts[cat] = cat_count + 1
-            source_counts[primary_source] = src_count + 1
+            if cat_count < max_per_tier1_category and src_count < max_per_source:
+                selected.append(r)
+                category_counts[cat] = cat_count + 1
+                source_counts[primary_source] = src_count + 1
+            else:
+                deferred.append(r)
         else:
             # Secondary categories & sources capped during pass 1
             if cat_count < max_per_sec_category and src_count < max_per_source:
@@ -464,6 +585,35 @@ class TelegramDigestFormatter:
     def __init__(self, safe_limit: int = SAFE_CHUNK_LIMIT) -> None:
         self.safe_limit = safe_limit
 
+    def format_event(
+        self,
+        summary: EventSummary,
+        event: Any = None,
+        category: TopicCategory | None = None,
+        confidence_label: ConfidenceLabel = "uncertain",
+        rank: int = 1,
+        total: int = 1,
+        is_analysis: bool = False,
+        published_at: datetime | None = None,
+    ) -> str:
+        """Format an event or summary into a structured HTML block."""
+        cat = category or getattr(event, "category", None) or TopicCategory.UNCERTAIN
+        analysis = is_analysis or getattr(event, "is_analysis", False)
+        pub_at = published_at or getattr(event, "published_at", None)
+        update_flag = getattr(event, "is_update", False) or getattr(event, "title", "").startswith(
+            "[UPDATE]"
+        )
+        return self.format_event_block(
+            summary=summary,
+            category=cat,
+            confidence_label=confidence_label,
+            rank=rank,
+            total=total,
+            is_analysis=analysis,
+            is_update=update_flag,
+            published_at=pub_at,
+        )
+
     def format_event_block(
         self,
         summary: EventSummary,
@@ -472,6 +622,7 @@ class TelegramDigestFormatter:
         rank: int,
         total: int,
         is_analysis: bool = False,
+        is_update: bool = False,
         published_at: datetime | None = None,
     ) -> str:
         """Format a single event summary into a structured HTML block."""
@@ -506,14 +657,65 @@ class TelegramDigestFormatter:
                     confidence_label = "single_source"
             elif not are_sources_genuinely_independent(summary.sources or ()):
                 confidence_label = "single_source"
-        cat_badge = CATEGORY_LABELS.get(category, "🌐 GEOPOLITICAL")
+        cat_key = getattr(category, "category", category)
+        cat_badge = CATEGORY_LABELS.get(cat_key, "🌐 GEOPOLITICAL")
         has_official = any(
             OFFICIAL_SOURCE_PATTERNS.search(s.source_name)
             or OFFICIAL_SOURCE_PATTERNS.search(s.title)
             for s in (summary.sources or [])
         )
-        if confidence_label == "corroborated" and has_official:
+        # Explicit corroboration status takes strict precedence when evaluated
+        corrob_status = getattr(summary, "corroboration_status", None)
+        corrob_status_norm = str(corrob_status).strip().lower() if corrob_status else "unassessed"
+        conf_qual_lower = (summary.confidence_qualification or "").lower()
+        unique_urls = {
+            normalize_url(s.url) for s in (summary.sources or ()) if getattr(s, "url", None)
+        }
+
+        if corrob_status_norm == "conflicting_evidence":
+            conf_badge = "[DISPUTED]"
+        elif corrob_status_norm == "insufficient_information":
+            if "single-source" in conf_qual_lower or "single source" in conf_qual_lower:
+                conf_badge = "[SINGLE SOURCE]"
+            else:
+                conf_badge = "[PRELIMINARY]"
+        elif summary.sources and len(unique_urls) <= 1 and corrob_status_norm != "unassessed":
+            conf_badge = "[OFFICIAL ANNOUNCEMENT]" if has_official else "[SINGLE SOURCE]"
+        elif corrob_status_norm in ("multiple_reports_shared_origin", "shared_origin"):
+            if (
+                confidence_label == "corroborated"
+                and len(unique_urls) >= 2
+                and category == TopicCategory.SANCTIONS
+            ):
+                conf_badge = "[OFFICIAL ANNOUNCEMENT]" if has_official else "[CORROBORATED]"
+            else:
+                conf_badge = "[OFFICIAL ANNOUNCEMENT]" if has_official else "[SHARED ORIGIN]"
+        elif corrob_status_norm == "official_announcement":
             conf_badge = "[OFFICIAL ANNOUNCEMENT]"
+        elif corrob_status_norm == "single_source":
+            conf_badge = "[OFFICIAL ANNOUNCEMENT]" if has_official else "[SINGLE SOURCE]"
+        elif corrob_status_norm == "independently_corroborated":
+            if len(unique_urls) <= 1:
+                conf_badge = "[SINGLE SOURCE]"
+            else:
+                conf_badge = "[OFFICIAL ANNOUNCEMENT]" if has_official else "[CORROBORATED]"
+        elif (
+            corrob_status_norm == "unassessed"
+            and confidence_label == "corroborated"
+            and len(unique_urls) >= 2
+            and (
+                "independent sources" in conf_qual_lower
+                or "independently verified" in conf_qual_lower
+            )
+            and "not independently" not in conf_qual_lower
+        ):
+            conf_badge = "[OFFICIAL ANNOUNCEMENT]" if has_official else "[CORROBORATED]"
+        elif has_official and (
+            confidence_label == "corroborated" or "official announcement" in conf_qual_lower
+        ):
+            conf_badge = "[OFFICIAL ANNOUNCEMENT]"
+        elif corrob_status_norm == "unassessed":
+            conf_badge = "[NOT ASSESSED]"
         else:
             conf_badge = CONFIDENCE_BADGES.get(confidence_label, "[REPORT]")
 
@@ -523,6 +725,13 @@ class TelegramDigestFormatter:
             header_badge = f"<b>[#{rank}/{total}] {cat_badge} · {conf_badge}</b>"
 
         cleaned_headline = _clean_rendered_text(summary.headline)
+        if (
+            is_update
+            or getattr(summary, "is_update", False)
+            or cleaned_headline.startswith("[UPDATE]")
+        ):
+            if not cleaned_headline.startswith("[UPDATE]"):
+                cleaned_headline = f"[UPDATE] {cleaned_headline}"
         cleaned_what = _clean_rendered_text(summary.what_happened)
 
         def render_claim_with_sources(claim: Any) -> str:
@@ -587,12 +796,19 @@ class TelegramDigestFormatter:
         )
 
         if summary.claims:
-            body_claims = [
-                render_claim_with_sources(claim)
+            accepted_claims = [
+                claim
                 for claim in summary.claims
                 if claim.verification_status == "accepted"
                 and claim.classification != "source_analysis"
             ]
+            non_duplicate_claims = [
+                c
+                for c in accepted_claims
+                if not is_headline_body_duplicate(c.text, cleaned_headline)
+            ]
+            target_claims = non_duplicate_claims if non_duplicate_claims else accepted_claims
+            body_claims = [render_claim_with_sources(c) for c in target_claims]
             rendered_body = "\n".join(text for text in body_claims if text)
             if not rendered_body.strip():
                 rendered_body = escape_html(cleaned_what)
@@ -611,7 +827,10 @@ class TelegramDigestFormatter:
                 if getattr(s, "url", None) and getattr(s, "source_name", None)
             )
             links_suffix = f"<i>({all_links})</i>" if all_links else ""
-            if len(plain_what) >= 10 and not is_headline_body_duplicate(
+            if len(summary.claims) <= 1:
+                # If only one claim exists and it merely repeats the headline, omit duplicate body
+                rendered_body = ""
+            elif len(plain_what) >= 10 and not is_headline_body_duplicate(
                 cleaned_what, cleaned_headline
             ):
                 rendered_body = f"{escape_html(cleaned_what)} {links_suffix}".strip()
@@ -623,9 +842,16 @@ class TelegramDigestFormatter:
                 sig_html = escape_html(summary.significance.strip())
                 rendered_body = f"{sig_html} {links_suffix}".strip()
             else:
-                # If no meaningful supporting claim exists, preserve the headline and source link
-                # rather than copying the article or repeating the claim.
-                rendered_body = links_suffix.strip()
+                # Prioritize central claim with its supported details
+                accepted_factual = [
+                    render_claim_with_sources(c)
+                    for c in getattr(summary, "claims", ())
+                    if c.verification_status == "accepted" and c.classification != "source_analysis"
+                ]
+                if accepted_factual:
+                    rendered_body = "\n".join(t for t in accepted_factual if t)
+                else:
+                    rendered_body = ""
 
         # Invariant: Never strip the only readable factual narrative from an event
         if len(extract_plain_narrative(rendered_body)) < 10:
@@ -641,6 +867,10 @@ class TelegramDigestFormatter:
                     ]
                     if accepted_factual:
                         rendered_body = render_claim_with_sources(accepted_factual[0])
+            else:
+                # When what duplicates headline and no substantive body exists,
+                # ensure rendered_body is empty
+                rendered_body = ""
 
         # Invariant: Never divide a sentence across headline and body
         plain_first = extract_plain_narrative(rendered_body)
@@ -652,7 +882,7 @@ class TelegramDigestFormatter:
             header_badge,
             f"<b>{escape_html(cleaned_headline)}</b>\n",
         ]
-        if rendered_body:
+        if rendered_body and len(extract_plain_narrative(rendered_body)) >= 10:
             lines.append(rendered_body)
 
         # Key details (omit absent, unspecified, or placeholder fields)
@@ -743,17 +973,40 @@ class TelegramDigestFormatter:
         if kd_bullets:
             lines.append("\n<b>Key Details:</b>\n" + "\n".join(kd_bullets))
 
-        # Strategic significance (omit if null or unspecified)
+        # Strategic significance (omit if null, unspecified, or generic boilerplate)
         if summary.significance:
             sig_clean = summary.significance.strip()
-            if sig_clean.lower() not in {
-                "null",
-                "none",
-                "n/a",
-                "nil",
-                "unspecified",
-                "unspecified in reporting",
-            }:
+            # Omit generic clichés like 'Strengthens deterrence.' or 'Enhances regional stability.'
+            is_generic = bool(
+                re.match(
+                    r"^(?:strengthens?|enhances?|boosts?|improves?|bolsters?|advances?|reinforces?)\s+"
+                    r"(?:deterrence|regional\s+stability|stability|sovereign\s+capabilities?|"
+                    r"strategic\s+resilience|resilience|security|defence\s+posture|allied\s+readiness)\.?$",
+                    sig_clean,
+                    re.I,
+                )
+            ) or (
+                len(sig_clean.split()) <= 6
+                and bool(
+                    re.search(
+                        r"\b(?:strengthens|enhances|boosts|improves|bolsters)\b",
+                        sig_clean,
+                        re.I,
+                    )
+                )
+            )
+            if (
+                sig_clean.lower()
+                not in {
+                    "null",
+                    "none",
+                    "n/a",
+                    "nil",
+                    "unspecified",
+                    "unspecified in reporting",
+                }
+                and not is_generic
+            ):
                 analysis_claims = [
                     render_claim_with_sources(claim)
                     for claim in summary.claims
@@ -799,21 +1052,46 @@ class TelegramDigestFormatter:
             ),
             "uncertain": "Preliminary reporting; subject to ongoing verification.",
             "unconfirmed": "Preliminary reporting; subject to ongoing verification.",
+            "multiple_reports_shared_origin": (
+                "Reported across multiple outlets based on a shared wire or official statement; "
+                "not independently confirmed."
+            ),
+            "conflicting_evidence": (
+                "Contested claims; opposing parties provide conflicting accounts or denials."
+            ),
+            "insufficient_information": ("Preliminary reporting; source relationships unverified."),
+            "independently_corroborated": (
+                "Independent reporting from distinct sources; "
+                "operational details not independently verified."
+            ),
+            "unassessed": "Unassessed; corroboration analysis not performed.",
         }
         slug_norm = assessment_text.lower().replace("-", "_").strip()
         if slug_norm in raw_slugs:
             assessment_text = raw_slugs[slug_norm]
 
         # Enforce consistency between badge and assessment text
-        if confidence_label == "single_source":
+        if conf_badge == "[NOT ASSESSED]":
+            if (
+                not assessment_text
+                or len(assessment_text) < 15
+                or "corroborat" in assessment_text.lower()
+                or "single-source" in assessment_text.lower()
+                or "unassessed" in slug_norm
+            ):
+                assessment_text = "Unassessed; corroboration analysis not performed."
+        elif conf_badge == "[SINGLE SOURCE]":
             if (
                 not assessment_text
                 or len(assessment_text) < 15
                 or "corroborat" in assessment_text.lower()
                 or "disput" in assessment_text.lower()
+                or "across outlets" in assessment_text.lower()
+                or "multiple" in assessment_text.lower()
+                or assessment_text.lower().startswith("single-source report;")
             ):
                 assessment_text = "Single-source reporting; unverified independently."
-        elif confidence_label == "disputed":
+        elif conf_badge == "[DISPUTED]":
             if (
                 not assessment_text
                 or len(assessment_text) < 15
@@ -825,12 +1103,27 @@ class TelegramDigestFormatter:
                 assessment_text = (
                     "Contested claims; opposing parties provide conflicting accounts or denials."
                 )
-        elif confidence_label == "corroborated":
-            if has_official:
-                assessment_text = (
-                    "Reported across multiple outlets based on official announcement; "
-                    "military details not independently verified."
-                )
+        elif conf_badge in ("[CORROBORATED]", "[OFFICIAL ANNOUNCEMENT]", "[SHARED ORIGIN]"):
+            if conf_badge == "[OFFICIAL ANNOUNCEMENT]" or has_official:
+                if (
+                    not assessment_text
+                    or len(assessment_text) < 15
+                    or "corroborat" in assessment_text.lower()
+                ):
+                    assessment_text = (
+                        "Reported across multiple outlets based on official announcement; "
+                        "military details not independently verified."
+                    )
+            elif conf_badge == "[SHARED ORIGIN]":
+                if (
+                    not assessment_text
+                    or len(assessment_text) < 15
+                    or "single-source" in assessment_text.lower()
+                ):
+                    assessment_text = (
+                        "Reported across multiple outlets based on shared source material; "
+                        "not independently corroborated."
+                    )
             elif assessment_text and (
                 "independently verified operational details" in assessment_text.lower()
                 or "operational details independently verified" in assessment_text.lower()
@@ -846,7 +1139,7 @@ class TelegramDigestFormatter:
                     "Independent reporting from distinct sources; "
                     "operational details not independently verified."
                 )
-        elif confidence_label == "uncertain":
+        elif conf_badge == "[PRELIMINARY]":
             if (
                 not assessment_text
                 or len(assessment_text) < 15
@@ -952,18 +1245,15 @@ class TelegramDigestFormatter:
             include_low_priority=include_low_priority,
         )
 
-        candidate_count = sum(
-            1
-            for r in results
-            if (
-                (r.status == "success" and r.summary is not None)
-                or (r.summary is not None and getattr(r.summary, "model_used", "") == "omitted")
-            )
-            and r.status != "quarantined"
+        total_clusters_count = len(results)
+        quarantined_count = sum(
+            1 for r in results if r.status in {"quarantined", "insufficient_evidence", "failed"}
         )
         omitted_note = ""
         omitted_count = (
-            max(0, candidate_count - len(ordered_successful)) if len(ordered_successful) > 0 else 0
+            max(0, total_clusters_count - len(ordered_successful) - quarantined_count)
+            if len(ordered_successful) > 0
+            else 0
         )
         if omitted_count > 0 and len(ordered_successful) > 0:
             if max_events is not None and max_events > 0:
@@ -1070,6 +1360,9 @@ class TelegramDigestFormatter:
         for idx, res in enumerate(ordered_successful, start=1):
             assert res.summary is not None
             evt = res.event
+            update_flag = getattr(evt, "is_update", False) or getattr(evt, "title", "").startswith(
+                "[UPDATE]"
+            )
             block = self.format_event_block(
                 summary=res.summary,
                 category=evt.category,
@@ -1077,6 +1370,7 @@ class TelegramDigestFormatter:
                 rank=idx,
                 total=total_events,
                 is_analysis=getattr(evt, "is_analysis", False),
+                is_update=update_flag,
                 published_at=getattr(evt, "published_at", None),
             )
             event_blocks.append(block)

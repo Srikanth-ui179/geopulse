@@ -354,6 +354,7 @@ def test_cli_summarize_fixture_mock_model_succeeds(capsys, monkeypatch):
 
 def test_cli_summarize_unreachable_ollama_reports_clean_diagnostic(capsys, monkeypatch):
     # Running without --mock-model when Ollama is offline reports UNAVAILABLE cleanly
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
     monkeypatch.setenv("OLLAMA_BASE_URL", "http://127.0.0.1:59999")
     exit_code = main(["summarize", "--fixture", "--limit", "1"])
     captured = capsys.readouterr().out
@@ -638,6 +639,7 @@ def test_telegram_formatter_renders_petraeus_and_uk_france_summaries_with_ground
     art_petraeus = ArticleRecord(
         source_name="Defense News",
         title=petraeus_title,
+        author="Colin Demarest",
         url="https://defensenews.com/petraeus-autonomous-war",
         canonical_url="https://defensenews.com/petraeus-autonomous-war",
         published_at=datetime(2026, 10, 23, 14, 0, tzinfo=UTC),

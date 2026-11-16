@@ -1,0 +1,79 @@
+name: Geopulse Daily Intelligence Briefing
+
+on:
+  schedule:
+    # 18:00 IST is 12:30 UTC
+    - cron: '30 12 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run mode (preview briefing without sending to Telegram)'
+        type: boolean
+        default: true
+        required: true
+
+concurrency:
+  group: geopulse-daily-briefing
+  cancel-in-progress: false
+
+jobs:
+  briefing:
+    name: Generate & Deliver Briefing
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Restore Geopulse State & Models Cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .geopulse/delivery_state.json
+            .geopulse/delivery_state.lock
+            .geopulse/article_cache
+            .geopulse/models
+          key: geopulse-state-${{ github.run_id }}
+          restore-keys: |
+            geopulse-state-
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+
+      - name: Execute Daily Briefing Pipeline
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          LLM_PROVIDER: gemini
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.8-flash' }}
+          PYTHONUNBUFFERED: "1"
+        run: |
+          mkdir -p .geopulse
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "Executing Geopulse daily briefing in PREVIEW mode..."
+            python -m geopulse.cli brief --preview --edition daily --max-events 6 --candidate-cap 8
+          else
+            echo "Executing Geopulse daily briefing in LIVE SEND mode..."
+            python -m geopulse.cli brief --send --edition daily --max-events 6 --candidate-cap 8
+          fi
+
+      - name: Save Geopulse State & Models Cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .geopulse/delivery_state.json
+            .geopulse/delivery_state.lock
+            .geopulse/article_cache
+            .geopulse/models
+          key: geopulse-state-${{ github.run_id }}

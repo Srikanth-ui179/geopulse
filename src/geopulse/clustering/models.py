@@ -2,14 +2,23 @@
 
 import uuid
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from geopulse.classification.models import TopicCategory
 from geopulse.ingestion.models import ArticleRecord
 
-ConfidenceLabel = Literal["corroborated", "single_source", "disputed", "uncertain"]
+ConfidenceLabel = Literal[
+    "corroborated",
+    "single_source",
+    "disputed",
+    "uncertain",
+    "independently_corroborated",
+    "multiple_reports_shared_origin",
+    "conflicting_evidence",
+    "insufficient_information",
+]
 
 
 class EventCluster(BaseModel):
@@ -31,10 +40,42 @@ class EventCluster(BaseModel):
         default=False,
         description="Whether this event represents strategic analysis rather than breaking news",
     )
+    is_update: bool = Field(
+        default=False,
+        description="Whether this event represents an update to a previously reported event",
+    )
+    persistent_event_id: str | None = Field(
+        default=None,
+        description="Persistent canonical event ID across daily briefings",
+    )
     confidence_label: ConfidenceLabel = Field(
         default="uncertain",
         description="corroborated, single_source, disputed, or uncertain",
     )
+    corroboration_status: str = Field(
+        default="unassessed",
+        description="Phase 3 corroboration status",
+    )
+    independent_chains_count: int = Field(
+        default=0,
+        ge=0,
+        description="Demonstrably independent evidence chains",
+    )
+
+    @field_validator("corroboration_status", mode="before")
+    @classmethod
+    def _normalize_corroboration_status(cls, v: Any) -> str:
+        if v is None or str(v).strip().lower() in ("", "none", "null"):
+            return "unassessed"
+        return str(v).strip()
+
+    @field_validator("independent_chains_count", mode="before")
+    @classmethod
+    def _normalize_independent_chains(cls, v: Any) -> int:
+        if v is None:
+            return 0
+        return int(v)
+
     articles: tuple[ArticleRecord, ...] = Field(
         default_factory=tuple,
         description="Source articles reporting on this event",

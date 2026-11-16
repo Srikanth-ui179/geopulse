@@ -1,10 +1,14 @@
 """Lightweight similarity and entity matching for geopolitical event clustering."""
 
+from __future__ import annotations
+
+import hashlib
 import re
 from collections.abc import Sequence
 from datetime import timedelta
 
 from geopulse.classification.models import TopicCategory
+from geopulse.clustering.models import EventCluster
 from geopulse.ingestion.models import ArticleRecord
 
 # Standard English and news-filler stopwords to ignore during similarity scoring
@@ -351,7 +355,9 @@ def tokenize(text: str) -> list[str]:
         return []
     words = _TOKEN_RE.findall(text.lower())
     tokens: list[str] = []
-    for w in words:
+    for raw in words:
+        # Strip trailing possessive 's (e.g. "iwi's" -> "iwi", "russia's" -> "russia")
+        w = re.sub(r"'s$", "", raw)
         # Split non-numeric hyphenated compound terms (e.g. 'uk-france', 'nuclear-strike')
         # while preserving military alphanumerics (e.g. 'f-35')
         if "-" in w and not re.search(r"\d", w):
@@ -409,6 +415,59 @@ def extract_policy_identifiers(text: str) -> set[str]:
             found.add("national_defence_strategy")
         else:
             found.add(raw)
+    return found
+
+
+# Specific defence corporate entities, military systems, and programs
+DEFENSE_ENTITIES_AND_SYSTEMS: dict[str, str] = {
+    "israel weapons industry": "iwi",
+    "iwi": "iwi",
+    "naval group": "naval_group",
+    "mbda": "mbda",
+    "saildrone": "saildrone",
+    "rheinmetall": "rheinmetall",
+    "lockheed martin": "lockheed",
+    "lockheed": "lockheed",
+    "rtx": "raytheon",
+    "raytheon": "raytheon",
+    "bae systems": "bae",
+    "bae": "bae",
+    "general dynamics": "general_dynamics",
+    "northrop grumman": "northrop",
+    "northrop": "northrop",
+    "kongsberg": "kongsberg",
+    "elbit systems": "elbit",
+    "elbit": "elbit",
+    "rafael": "rafael",
+    "hanwha": "hanwha",
+    "anduril": "anduril",
+    "thales": "thales",
+    "saab": "saab",
+    "arbel": "arbel_system",
+    "scx 26": "scx_26",
+    "scx-26": "scx_26",
+    "counter-drone": "tech:counter_drone",
+    "counter drone": "tech:counter_drone",
+    "c-uas": "tech:counter_drone",
+    "cuas": "tech:counter_drone",
+    "uuv": "tech:uuv",
+    "unmanned underwater vessel": "tech:uuv",
+    "autonomous underwater vehicle": "tech:uuv",
+    "drone sub": "tech:uuv",
+    "usv": "tech:usv",
+    "unmanned surface vessel": "tech:usv",
+}
+
+
+def extract_defense_entities_and_platforms(text: str) -> set[str]:
+    """Extract recognized defense companies, platforms, and technological systems."""
+    if not text:
+        return set()
+    lower = text.lower()
+    found = set()
+    for phrase, canonical in DEFENSE_ENTITIES_AND_SYSTEMS.items():
+        if re.search(rf"\b{re.escape(phrase)}\b", lower):
+            found.add(canonical)
     return found
 
 
@@ -501,6 +560,8 @@ def compute_article_similarity(
             (TopicCategory.WEAPONS_PROCUREMENT, TopicCategory.ARMED_CONFLICT),
             (TopicCategory.DEFENCE_POLICY, TopicCategory.ARMED_CONFLICT),
             (TopicCategory.SANCTIONS, TopicCategory.TERRORISM_INSURGENCY),
+            (TopicCategory.INTELLIGENCE_ESPIONAGE, TopicCategory.ARMED_CONFLICT),
+            (TopicCategory.MILITARY_TECHNOLOGY, TopicCategory.ARMED_CONFLICT),
         }
         if (topic_a, topic_b) in incompatible_pairs or (topic_b, topic_a) in incompatible_pairs:
             return 0.0
@@ -543,8 +604,14 @@ def compute_article_similarity(
         location_bonus = 0.15 + (0.05 if len(matching_locs) >= 2 else 0.0)
 
     topic_bonus = 0.0
-    if topic_a and topic_b and topic_a == topic_b and topic_a != TopicCategory.UNCERTAIN:
-        topic_bonus = 0.05
+    if topic_a and topic_b:
+        if topic_a == topic_b and topic_a != TopicCategory.UNCERTAIN:
+            topic_bonus = 0.05
+        elif {topic_a, topic_b} == {
+            TopicCategory.DEFENCE_POLICY,
+            TopicCategory.WEAPONS_PROCUREMENT,
+        }:
+            topic_bonus = 0.03
 
     # 7. Policy and procurement initiative co-reference bonus
     policy_bonus = 0.0
@@ -564,7 +631,21 @@ def compute_article_similarity(
             if has_shared_entity:
                 policy_bonus = 0.25
 
-    # 8. Composite score combining title, bigram, full-text, cross-containment, and location
+    # 8. Defense entity and system co-reference bonus
+    entity_bonus = 0.0
+    entities_a = extract_defense_entities_and_platforms(text_a)
+    entities_b = extract_defense_entities_and_platforms(text_b)
+    shared_entities = entities_a & entities_b
+    if shared_entities:
+        has_named_system = any(e in {"arbel_system", "scx_26"} for e in shared_entities)
+        if has_named_system and len(shared_entities) >= 2:
+            entity_bonus = 0.25
+        elif has_named_system or len(shared_entities) >= 2:
+            entity_bonus = 0.20
+        else:
+            entity_bonus = 0.10
+
+    # 9. Composite score combining title, bigram, full-text, cross-containment, and location
     composite = (
         (title_jaccard * 0.30)
         + (bigram_jaccard * 0.15)
@@ -573,6 +654,7 @@ def compute_article_similarity(
         + location_bonus
         + topic_bonus
         + policy_bonus
+        + entity_bonus
     )
 
     # Slight penalty for greater time separation within the 48-hour window
@@ -718,3 +800,164 @@ def has_single_origin_dependency(
             return True, first_ent
 
     return False, None
+
+
+# ==============================================================================
+# Cross-Day Event Deduplication & Event Identity Infrastructure
+# ==============================================================================
+
+_CORE_FACILITY_PATTERNS = re.compile(
+    r"\b((?:RAF|Fort|Camp)\s+[A-Z][a-z]+|(?:Air Base|Naval Base)\s+[A-Z][a-z]+)\b",
+)
+
+_MEANINGFUL_DEVELOPMENT_PATTERNS = re.compile(
+    r"\b(?:"
+    r"charged|indicted|court\s+appearance|appeared\s+in\s+court|arraigned|"
+    r"pleaded\s+guilty|sentenced|convicted|bail\s+denied|extradited|"
+    r"death\s+toll\s+(?:rose|rises|climbed|reaches|reached)|"
+    r"casualties\s+(?:rose|increased|confirmed)|bodies\s+recovered|"
+    r"signed\s+(?:a\s+)?(?:ceasefire|treaty|accord|deal)|"
+    r"ceasefire\s+(?:takes\s+effect|took\s+effect|enters?\s+into\s+force)|"
+    r"hostages?\s+released|prisoner\s+exchange\s+completed|"
+    r"sanctions\s+imposed|sanctions\s+enacted|"
+    r"(?<!\bno\s)new\s+(?:charges|evidence|arrests|suspects)"
+    r")\b",
+    re.I,
+)
+
+
+def extract_event_core_facility(text: str) -> str | None:
+    """Extract explicit military base, air station, or specific facility from text."""
+    m = _CORE_FACILITY_PATTERNS.search(text)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def compute_event_hash(event: EventCluster) -> str:
+    """Compute deterministic content hash for an event cluster based on title and source URLs."""
+    urls = sorted(a.canonical_url for a in getattr(event, "articles", ()))
+    key = f"{event.title.strip().lower()}|{'|'.join(urls)}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def compute_event_semantic_signature(event: EventCluster) -> str:
+    """Compute semantic event signature for cross-day deduplication and persistent identity."""
+    combined_text = f"{event.title} " + " ".join(
+        f"{a.title} {a.snippet or ''}" for a in getattr(event, "articles", ())
+    )
+    facility = extract_event_core_facility(combined_text)
+    fac_slug = re.sub(r"\W+", "_", facility.lower()).strip("_") if facility else ""
+
+    suspect_m = re.search(
+        r"\b(?:Sergeant|Sgt\.?|Soldier|Captain|Major|Colonel|Analyst|Contractor|Officer)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b",
+        combined_text,
+    )
+    suspect_slug = re.sub(r"\W+", "_", suspect_m.group(1).lower()).strip("_") if suspect_m else ""
+
+    theme = "general"
+    if re.search(
+        r"\b(sabotage|plot|activist|break-in|protest|terror|terrorist|security\s+threat)\b",
+        combined_text,
+        re.I,
+    ):
+        theme = "sabotage_plot"
+    elif re.search(
+        r"\b(espionage|treason|selling\s+secrets|classified\s+documents?)\b", combined_text, re.I
+    ):
+        theme = "espionage"
+    elif re.search(r"\b(airstrike|drone\s+strike|missile\s+strike|bombing)\b", combined_text, re.I):
+        theme = "strike"
+    elif re.search(r"\b(procurement|contract|arms\s+sale)\b", combined_text, re.I):
+        theme = "procurement"
+    elif re.search(r"\b(ceasefire|peace\s+talks?|treaty)\b", combined_text, re.I):
+        theme = "diplomacy"
+
+    cat_slug = getattr(event.category, "value", str(event.category)).lower()
+    return f"sig:{cat_slug}:{fac_slug}:{suspect_slug}:{theme}"
+
+
+def is_same_underlying_event(
+    new_event: EventCluster,
+    prev_event_or_sig: EventCluster | str,
+) -> bool:
+    """Determine whether new_event describes the same underlying real-world event across days."""
+    if not isinstance(prev_event_or_sig, (str, EventCluster)):
+        return False
+    new_combined = f"{new_event.title} " + " ".join(
+        f"{a.title} {a.snippet or ''}" for a in getattr(new_event, "articles", ())
+    )
+    new_facility = extract_event_core_facility(new_combined)
+
+    if isinstance(prev_event_or_sig, str):
+        if not prev_event_or_sig.startswith("sig:"):
+            return False
+        new_sig = compute_event_semantic_signature(new_event)
+        if new_sig == prev_event_or_sig:
+            return True
+        parts_prev = prev_event_or_sig.split(":")
+        parts_new = new_sig.split(":")
+        if len(parts_prev) >= 5 and len(parts_new) >= 5:
+            if parts_prev[2] and parts_prev[2] == parts_new[2]:
+                if parts_prev[4] == parts_new[4] and parts_prev[4] != "general":
+                    return True
+            if parts_prev[3] and parts_prev[3] == parts_new[3]:
+                return True
+        return False
+
+    prev_event = prev_event_or_sig
+    prev_combined = f"{prev_event.title} " + " ".join(
+        f"{a.title} {a.snippet or ''}" for a in getattr(prev_event, "articles", ())
+    )
+    prev_facility = extract_event_core_facility(prev_combined)
+
+    if new_facility and prev_facility and new_facility.lower() == prev_facility.lower():
+        new_theme = re.search(
+            r"\b(plot|sabotage|break-in|protest|security|investigation|activist|charged)\b",
+            new_combined,
+            re.I,
+        )
+        prev_theme = re.search(
+            r"\b(plot|sabotage|break-in|protest|security|investigation|activist|charged)\b",
+            prev_combined,
+            re.I,
+        )
+        if new_theme and prev_theme:
+            return True
+        new_deploy = re.search(r"\b(deploy|exercise|bomber|flight|drill)\b", new_combined, re.I)
+        prev_deploy = re.search(r"\b(deploy|exercise|bomber|flight|drill)\b", prev_combined, re.I)
+        if bool(new_deploy) != bool(prev_deploy):
+            return False
+
+    new_suspect = re.search(
+        r"\b(?:Sergeant|Sgt\.?|Soldier|Captain|Major|Colonel|Analyst|Contractor|Officer)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b",
+        new_combined,
+    )
+    prev_suspect = re.search(
+        r"\b(?:Sergeant|Sgt\.?|Soldier|Captain|Major|Colonel|Analyst|Contractor|Officer)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,2})\b",
+        prev_combined,
+    )
+    if (
+        new_suspect
+        and prev_suspect
+        and new_suspect.group(1).lower() == prev_suspect.group(1).lower()
+    ):
+        return True
+
+    return False
+
+
+def has_meaningful_development(event: EventCluster) -> bool:
+    """Check if an event cluster contains a material progression/update rather than status quo."""
+    combined_text = f"{event.title} " + " ".join(
+        f"{a.title} {a.snippet or ''}" for a in getattr(event, "articles", ())
+    )
+    return bool(_MEANINGFUL_DEVELOPMENT_PATTERNS.search(combined_text))
+
+
+def mark_event_as_update(event: EventCluster) -> EventCluster:
+    """Return a copy of the event cluster marked as an update."""
+    title = event.title
+    if not title.startswith("[UPDATE]"):
+        title = f"[UPDATE] {title}"
+    return event.model_copy(update={"is_update": True, "title": title})

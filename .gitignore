@@ -60,4 +60,6 @@ desktop.ini
 # Logs and Scratch Files
 *.log
 scratch/
+scratch_*
+geopulse-original-dns.txt
 tmp/

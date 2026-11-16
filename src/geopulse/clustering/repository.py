@@ -420,6 +420,12 @@ class SupabaseEventRepository(EventRepository):
                     is_analysis=bool(row.get("is_analysis", False)),
                     confidence_label=row.get("confidence_label", "uncertain"),
                     articles=tuple(articles),
+                    corroboration_status=row.get("corroboration_status"),
+                    independent_chains_count=(
+                        int(row["independent_chains_count"])
+                        if row.get("independent_chains_count") is not None
+                        else 0
+                    ),
                 )
             )
 
@@ -499,6 +505,11 @@ class SupabaseEventRepository(EventRepository):
                 payload["confidence_qualification"] = conf_qual
             if model_used_text:
                 payload["model_used"] = model_used_text
+            if hasattr(r, "summary") and r.summary is not None and not isinstance(r.summary, str):
+                if getattr(r.summary, "corroboration_status", None):
+                    payload["corroboration_status"] = r.summary.corroboration_status
+                if getattr(r.summary, "independent_chains_count", None) is not None:
+                    payload["independent_chains_count"] = r.summary.independent_chains_count
 
             if payload:
                 self.client.table("events").update(payload).eq("id", ev_id).execute()

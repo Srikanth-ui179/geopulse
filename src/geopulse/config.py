@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3.2:3b"
     ollama_timeout: float = 120.0
+    ollama_request_timeout: float = 180.0
+    ollama_max_retries: int = 1
 
     llm_provider: Literal["ollama", "gemini", "auto"] = "ollama"
     gemini_api_key: SecretStr | None = None
@@ -46,10 +48,25 @@ class Settings(BaseSettings):
     telegram_api_base_url: str = "https://api.telegram.org"
     telegram_timeout: float = 15.0
     delivery_state_file: Path = Path(".geopulse/delivery_state.json")
-    feed_limit: int = 10
+    feed_limit: int = 25
     lookback_hours: int | None = None
     min_relevance_rank: float | None = 9.0
     include_low_priority: bool = False
+    candidate_cap: int = 12
+
+    # Phase 1: Local NLI claim verification settings
+    nli_verification_enabled: bool = False
+    nli_model_dir: Path = Path(".geopulse/models/nli-deberta-v3-small")
+    nli_quantized: bool = True
+    nli_entailment_threshold: float = 0.60
+    nli_contradiction_threshold: float = 0.50
+    nli_batch_size: int = 16
+    nli_intra_threads: int = 4
+
+    # Phase 2: Article Revision History & Retention Settings
+    retention_policy: Literal["full_text", "evidence_snippets_only", "metadata_only"] = "full_text"
+    retention_ttl_days: int = 90
+    article_revisions_enabled: bool = True
 
     @field_validator("supabase_url")
     @classmethod
@@ -135,6 +152,27 @@ class Settings(BaseSettings):
     def validate_feed_limit(cls, value: int) -> int:
         if value < 1:
             raise ValueError("FEED_LIMIT must be at least 1")
+        return value
+
+    @field_validator("candidate_cap")
+    @classmethod
+    def validate_candidate_cap(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("CANDIDATE_CAP must be at least 1")
+        return value
+
+    @field_validator("ollama_request_timeout")
+    @classmethod
+    def validate_ollama_request_timeout(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("OLLAMA_REQUEST_TIMEOUT must be greater than 0")
+        return float(value)
+
+    @field_validator("ollama_max_retries")
+    @classmethod
+    def validate_ollama_max_retries(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("OLLAMA_MAX_RETRIES must be non-negative")
         return value
 
     def is_admin(self, user_id: str | int | None) -> bool:

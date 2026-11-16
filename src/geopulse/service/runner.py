@@ -31,8 +31,9 @@ from geopulse.summarization.service import EventSummarizer
 
 logger = logging.getLogger(__name__)
 
-MORNING_HOUR = 8  # 08:00 AM
-EVENING_HOUR = 20  # 08:00 PM
+DAILY_BRIEFING_HOUR = 18  # 06:00 PM (18:00 IST)
+MORNING_HOUR = 8  # 08:00 AM (legacy)
+EVENING_HOUR = 20  # 08:00 PM (legacy)
 
 
 class ServiceAlreadyRunningError(RuntimeError):
@@ -148,9 +149,14 @@ class ServiceRunner:
         """Return the current localized datetime in the configured timezone."""
         return datetime.now(self.settings.tz)
 
-    def should_trigger_briefing(self, now_dt: datetime, edition: str) -> bool:
+    def should_trigger_briefing(self, now_dt: datetime, edition: str = "daily") -> bool:
         """Evaluate whether a briefing edition is due and not yet sent."""
-        target_hour = MORNING_HOUR if edition == "morning" else EVENING_HOUR
+        if edition == "daily":
+            target_hour = DAILY_BRIEFING_HOUR
+        elif edition == "morning":
+            target_hour = MORNING_HOUR
+        else:
+            target_hour = EVENING_HOUR
         target_date = now_dt.date()
 
         # Check hour threshold
@@ -175,9 +181,9 @@ class ServiceRunner:
         return True
 
     def run_scheduled_briefing(
-        self, edition: str, target_date: date | None = None
+        self, edition: str = "daily", target_date: date | None = None
     ) -> PipelineResult:
-        """Execute a scheduled morning or evening briefing."""
+        """Execute a scheduled daily, morning, or evening briefing."""
         run_date = target_date or self.get_local_now().date()
         logger.info(
             "Starting scheduled %s briefing for %s (timezone: %s)...",
@@ -193,6 +199,8 @@ class ServiceRunner:
                 persistent=self.persistent,
                 send=True,
                 deduplicate_consecutive=True,
+                max_events=6 if edition == "daily" else None,
+                candidate_cap=8 if edition == "daily" else None,
             )
 
             is_success = result.delivery_result and result.delivery_result.status in {
@@ -302,9 +310,9 @@ class ServiceRunner:
         return handled
 
     def check_and_run_schedules(self, now_dt: datetime) -> dict[str, str]:
-        """Check morning and evening briefing triggers. Returns edition status map."""
+        """Check daily briefing trigger. Returns edition status map."""
         statuses: dict[str, str] = {}
-        for edition in ("morning", "evening"):
+        for edition in ("daily",):
             if self.should_trigger_briefing(now_dt, edition):
                 res = self.run_scheduled_briefing(edition, now_dt.date())
                 outcome = (
@@ -314,7 +322,11 @@ class ServiceRunner:
                 )
                 statuses[edition] = outcome
             else:
-                target_hour = MORNING_HOUR if edition == "morning" else EVENING_HOUR
+                target_hour = (
+                    DAILY_BRIEFING_HOUR
+                    if edition == "daily"
+                    else (MORNING_HOUR if edition == "morning" else EVENING_HOUR)
+                )
                 if now_dt.hour < target_hour:
                     statuses[edition] = f"not due (scheduled for {target_hour:02d}:00)"
                 else:

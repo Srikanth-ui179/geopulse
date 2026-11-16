@@ -49,6 +49,11 @@ class DeliveryRepository(ABC):
         """Retrieve the most recently sent briefing record, if any."""
         return None
 
+    def get_recent_briefings(self, limit: int = 5) -> list[BriefingRecord]:
+        """Retrieve recent sent briefing records (up to limit)."""
+        latest = self.get_latest_briefing()
+        return [latest] if latest else []
+
     def record_briefing_events(
         self,
         briefing_id: str,
@@ -61,6 +66,14 @@ class DeliveryRepository(ABC):
             tuple[int, int]: (briefing_events_count, evidence_records_count)
         """
         return 0, 0
+
+    def get_briefing_event_evidence(
+        self,
+        briefing_id: str,
+        event_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Retrieve persisted briefing event evidence records."""
+        return []
 
     def acquire_lock(self) -> bool:
         """Acquire delivery lock to prevent concurrent executions."""
@@ -153,16 +166,46 @@ class InMemoryDeliveryRepository(DeliveryRepository):
             if model_used_text:
                 row["model_used"] = model_used_text
 
+            if hasattr(res_item, "summary") and res_item.summary is not None:
+                corrob_status = getattr(res_item.summary, "corroboration_status", None)
+                chains_count = getattr(res_item.summary, "independent_chains_count", None)
+                if corrob_status:
+                    row["corroboration_status"] = corrob_status
+                if chains_count is not None:
+                    row["independent_chains_count"] = chains_count
+
             event_rows.append(row)
-            for a in getattr(res_item.event, "articles", ()):
-                art_id = url_to_id.get(a.canonical_url)
+            articles = getattr(res_item.event, "articles", ()) if hasattr(res_item, "event") else ()
+            from geopulse.corroboration.lineage import build_cluster_lineages
+
+            cluster_lineages = build_cluster_lineages(articles) if articles else {}
+            for a in articles:
+                art_id = url_to_id.get(a.canonical_url) or url_to_id.get(a.url)
                 if art_id:
-                    evidence_rows.append(
-                        {"briefing_id": briefing_id, "event_id": ev_id, "article_id": art_id}
-                    )
+                    lin = cluster_lineages.get(a.canonical_url) or cluster_lineages.get(a.url)
+                    evi_row: dict[str, Any] = {
+                        "briefing_id": briefing_id,
+                        "event_id": ev_id,
+                        "article_id": art_id,
+                    }
+                    if lin:
+                        evi_row["lineage_type"] = lin.lineage_classification
+                        evi_row["original_source"] = lin.original_source
+                    evidence_rows.append(evi_row)
         self._briefing_events[briefing_id] = event_rows
         self._briefing_evidence[briefing_id] = evidence_rows
         return len(event_rows), len(evidence_rows)
+
+    def get_briefing_event_evidence(
+        self,
+        briefing_id: str,
+        event_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Retrieve persisted briefing event evidence records."""
+        records = self._briefing_evidence.get(briefing_id, [])
+        if event_id:
+            return [r for r in records if r.get("event_id") == event_id]
+        return list(records)
 
     def acquire_lock(self) -> bool:
         if self._is_locked:
@@ -182,7 +225,11 @@ class InMemoryDeliveryRepository(DeliveryRepository):
         rec = self._records.get((briefing_date, clean_edition))
         if rec is not None:
             return rec
-        if clean_edition is None:
+        if clean_edition in (None, "daily"):
+            for alt_edition in ("daily", None):
+                rec = self._records.get((briefing_date, alt_edition))
+                if rec is not None:
+                    return rec
             for (d, _), r in self._records.items():
                 if d == briefing_date:
                     return r
@@ -221,6 +268,11 @@ class InMemoryDeliveryRepository(DeliveryRepository):
         if not sent_records:
             return None
         return max(sent_records, key=lambda r: r.completed_at or r.started_at)
+
+    def get_recent_briefings(self, limit: int = 5) -> list[BriefingRecord]:
+        sent_records = [r for r in self._records.values() if r.status == "sent"]
+        sent_records.sort(key=lambda r: r.completed_at or r.started_at, reverse=True)
+        return sent_records[:limit]
 
     def clear(self) -> None:
         self._records.clear()
@@ -366,9 +418,10 @@ class JsonFileDeliveryRepository(DeliveryRepository):
 
     @staticmethod
     def _make_key(briefing_date: date, edition: str | None = None) -> str:
-        if edition and edition.strip():
-            return f"{briefing_date.isoformat()}_{edition.strip().lower()}"
-        return briefing_date.isoformat()
+        clean = (edition or "").strip().lower()
+        if clean in ("daily", ""):
+            return briefing_date.isoformat()
+        return f"{briefing_date.isoformat()}_{clean}"
 
     def get_briefing_by_date(
         self,
@@ -378,10 +431,14 @@ class JsonFileDeliveryRepository(DeliveryRepository):
         data = self._load_data()
         key = self._make_key(briefing_date, edition)
         if key not in data:
-            if edition is None:
-                for k, v in data.items():
-                    if k.startswith(briefing_date.isoformat()) and isinstance(v, dict):
-                        key = k
+            clean = (edition or "").strip().lower()
+            if clean in ("", "daily"):
+                for candidate_key in (
+                    briefing_date.isoformat(),
+                    f"{briefing_date.isoformat()}_daily",
+                ):
+                    if candidate_key in data:
+                        key = candidate_key
                         break
                 else:
                     return None
@@ -531,6 +588,48 @@ class JsonFileDeliveryRepository(DeliveryRepository):
         if not records:
             return None
         return max(records, key=lambda r: r.completed_at or r.started_at)
+
+    def get_recent_briefings(self, limit: int = 5) -> list[BriefingRecord]:
+        data = self._load_data()
+        records: list[BriefingRecord] = []
+        for row in data.values():
+            if not isinstance(row, dict) or row.get("status") != "sent":
+                continue
+            try:
+                b_date = (
+                    date.fromisoformat(row["briefing_date"])
+                    if row.get("briefing_date")
+                    else date.today()
+                )
+                started_dt = (
+                    datetime.fromisoformat(row["started_at"])
+                    if row.get("started_at")
+                    else datetime.now(UTC)
+                )
+                completed_dt = (
+                    datetime.fromisoformat(row["completed_at"]) if row.get("completed_at") else None
+                )
+                raw_hashes = row.get("delivered_event_hashes") or ()
+                records.append(
+                    BriefingRecord(
+                        id=str(row.get("id", uuid.uuid4())),
+                        briefing_date=b_date,
+                        edition=row.get("edition"),
+                        status="sent",
+                        started_at=started_dt,
+                        completed_at=completed_dt,
+                        telegram_message_count=row.get("telegram_message_count", 0),
+                        error_message=row.get("error_message"),
+                        chunks_delivered=row.get("chunks_delivered", 0),
+                        telegram_message_ids=tuple(row.get("telegram_message_ids", ())),
+                        digest_hash=row.get("digest_hash"),
+                        delivered_event_hashes=tuple(raw_hashes),
+                    )
+                )
+            except Exception:
+                continue
+        records.sort(key=lambda r: r.completed_at or r.started_at, reverse=True)
+        return records[:limit]
 
     def clear(self) -> None:
         self.release_lock()
@@ -821,18 +920,33 @@ class SupabaseDeliveryRepository(DeliveryRepository):
             if model_used_text:
                 event_row["model_used"] = model_used_text
 
+            if hasattr(res_item, "summary") and res_item.summary is not None:
+                corrob_status = getattr(res_item.summary, "corroboration_status", None)
+                chains_count = getattr(res_item.summary, "independent_chains_count", None)
+                if corrob_status:
+                    event_row["corroboration_status"] = corrob_status
+                if chains_count is not None:
+                    event_row["independent_chains_count"] = chains_count
+
             event_rows.append(event_row)
 
-            for a in getattr(res_item.event, "articles", ()):
-                art_id = url_to_id.get(a.canonical_url)
+            articles = getattr(res_item.event, "articles", ()) if hasattr(res_item, "event") else ()
+            from geopulse.corroboration.lineage import build_cluster_lineages
+
+            cluster_lineages = build_cluster_lineages(articles) if articles else {}
+            for a in articles:
+                art_id = url_to_id.get(a.canonical_url) or url_to_id.get(a.url)
                 if art_id:
-                    evidence_rows.append(
-                        {
-                            "briefing_id": briefing_id,
-                            "event_id": ev_id,
-                            "article_id": art_id,
-                        }
-                    )
+                    lin = cluster_lineages.get(a.canonical_url) or cluster_lineages.get(a.url)
+                    evi_row_supa: dict[str, Any] = {
+                        "briefing_id": briefing_id,
+                        "event_id": ev_id,
+                        "article_id": art_id,
+                    }
+                    if lin:
+                        evi_row_supa["lineage_type"] = lin.lineage_classification
+                        evi_row_supa["original_source"] = lin.original_source
+                    evidence_rows.append(evi_row_supa)
 
         if event_rows:
             self.client.table("briefing_events").upsert(
@@ -848,3 +962,17 @@ class SupabaseDeliveryRepository(DeliveryRepository):
             ).execute()
 
         return len(event_rows), len(evidence_rows)
+
+    def get_briefing_event_evidence(
+        self,
+        briefing_id: str,
+        event_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Retrieve persisted briefing event evidence records."""
+        query = (
+            self.client.table("briefing_event_evidence").select("*").eq("briefing_id", briefing_id)
+        )
+        if event_id:
+            query = query.eq("event_id", event_id)
+        res = query.execute()
+        return list(res.data or [])

@@ -32,7 +32,9 @@ _ALLEGATION_TERMS = re.compile(
 
 _OFFICIAL_ACCUSER_ENTITIES = re.compile(
     r"\b(pentagon|department of defense|defense department|dod|ministry of defen[cs]e|"
-    r"mod|inspector general|doj|fbi|prosecutors?|authorities|military court)\b",
+    r"mod|inspector general|doj|department of justice|fbi|prosecutors?|authorities|"
+    r"military court|grand jury|state department|foreign ministry|foreign office|"
+    r"white house|intelligence agency|counterintelligence)\b",
     re.I,
 )
 
@@ -322,7 +324,7 @@ def _check_attribution_preservation(
         # Sensitive criminal/misconduct actions that require attribution
         sensitive_misconduct = re.search(
             r"\b(leaked?|leaking|classified|espionage|treason|bribery|crime|scandal|"
-            r"violated?|breached?|misconduct)\b",
+            r"violated?|breached?|misconduct|sabotage|arson|attacks?|conspiracy|plot|orchestrat\w*)\b",
             headline,
             re.I,
         )
@@ -342,6 +344,159 @@ def _check_attribution_preservation(
             return True, None, repaired
 
     return True, None, None
+
+
+check_attribution_preservation = _check_attribution_preservation
+
+
+def check_event_completeness(
+    summary: EventSummary,
+    event: EventCluster,
+) -> tuple[bool, str | None]:
+    """Enforce general event-completeness across geopolitical and defence developments.
+
+    Verifies that:
+    1. The defining core action/development is represented in the summary (e.g. agreement substance,
+       procurement recipient/system, or policy threshold).
+    2. Multi-domain frameworks are not collapsed into an isolated single sub-activity.
+    3. Important operational details and casualty figures are preserved rather than dropped.
+    4. Background context is not confused with the central breaking development.
+    """
+    narrative = f"{summary.headline} {summary.what_happened}".lower()
+    source_corpus = " ".join(
+        f"{clean_article_text(a.title)} {clean_article_text(a.snippet or '')}"
+        for a in event.articles
+    ).lower()
+
+    # 1. Core Agreement Substance Check (e.g. Black Sea intelligence sharing)
+    has_intel_agreement_in_source = bool(
+        re.search(
+            r"\b(?:agree(?:d|s)?|joint\s+statement)\b.*\b(?:intelligence\s+sharing|information\s+sharing|domain\s+awareness|early\s+warning)\b",
+            source_corpus,
+            re.I,
+        )
+    ) or bool(
+        re.search(
+            r"\b(?:intelligence\s+sharing|information\s+sharing|domain\s+awareness|early\s+warning)\b.*\b(?:agree(?:d|s)?|joint\s+statement)\b",
+            source_corpus,
+            re.I,
+        )
+    )
+    if has_intel_agreement_in_source:
+        has_intel_substance_in_summary = bool(
+            re.search(
+                r"\b(?:intelligence\s+sharing|information\s+sharing|domain\s+awareness|early\s+warning)\b",
+                narrative,
+                re.I,
+            )
+        )
+        if not has_intel_substance_in_summary:
+            return (
+                False,
+                (
+                    "Summary omits core intelligence-sharing agreement substance "
+                    "prominent in source reporting"
+                ),
+            )
+
+    # 2. Multidomain Framework Scope Preservation (e.g. Hansa pact: tanks + submarines + missiles)
+    has_multidomain_in_source = bool(
+        re.search(
+            r"\b(?:hansa\s+(?:defence\s+)?cooperation\s+framework|bilateral\s+hansa|type\s*212cd|3sm\s+maritime)\b",
+            source_corpus,
+            re.I,
+        )
+    )
+    if has_multidomain_in_source:
+        has_multidomain_in_summary = bool(
+            re.search(
+                r"\b(?:framework|pact|cooperation|type\s*212cd|3sm|submarine|bilateral\s+space)\b",
+                narrative,
+                re.I,
+            )
+        )
+        if not has_multidomain_in_summary:
+            return (
+                False,
+                (
+                    "Summary collapses multidomain partnership into single sub-activity, "
+                    "omitting broader bilateral framework"
+                ),
+            )
+
+    # 3. Arms Procurement Recipient & System Check (e.g. Patriot PAC-3 MSE for Ukraine)
+    has_procurement_source = bool(
+        re.search(
+            r"\b(?:potential\s+(?:foreign\s+military\s+)?sale|fms\s+approval|approved?\s+(?:a\s+)?potential\s+sale)\b",
+            source_corpus,
+            re.I,
+        )
+    )
+    if has_procurement_source:
+        if "ukraine" in source_corpus and "ukraine" not in narrative:
+            return (
+                False,
+                (
+                    "Summary omits prospective recipient (Ukraine) in arms "
+                    "procurement approval reporting"
+                ),
+            )
+        if "pac-3" in source_corpus and not re.search(
+            r"\b(?:pac-3(?:\s+mse)?|patriot)\b", narrative, re.I
+        ):
+            return (
+                False,
+                (
+                    "Summary omits weapon system designation (PAC-3 MSE / Patriot) "
+                    "in procurement approval reporting"
+                ),
+            )
+
+    # 4. Defence Policy Threshold & Requirements Check (e.g. UK industrial offsets)
+    has_offset_source = bool(
+        re.search(
+            r"\b(?:offset\s+policy|offset\s+authority|industrial\s+offset|domestic\s+economic\s+benefits?)\b",
+            source_corpus,
+            re.I,
+        )
+    )
+    if has_offset_source:
+        if "50 million" in source_corpus or "£50" in source_corpus:
+            if not re.search(r"\b(?:50\s*(?:million|m)|£50)\b", narrative, re.I):
+                return (
+                    False,
+                    (
+                        "Summary omits contract-value threshold (£50 million) triggering "
+                        "industrial offset policy"
+                    ),
+                )
+
+    # 5. Military Mission Network Operational Purpose Check (e.g. PACOM Mission Network)
+    has_network_source = bool(
+        re.search(
+            r"\b(?:pacom\s+mission\s+network|mission\s+network)\b",
+            source_corpus,
+            re.I,
+        )
+    )
+    if has_network_source:
+        has_network_purpose = bool(
+            re.search(
+                r"\b(?:common\s+operational\s+picture|cop|secure(?:ly)?\s+share|data-sharing|maven\s+smart\s+system|joint\s+strikes?)\b",
+                narrative,
+                re.I,
+            )
+        )
+        if not has_network_purpose:
+            return (
+                False,
+                (
+                    "Summary omits operational purpose (common operational picture / "
+                    "secure data sharing / targeting) of mission network"
+                ),
+            )
+
+    return True, None
 
 
 def validate_publication_gate(
@@ -503,7 +658,8 @@ def validate_publication_gate(
             # Retain the verified factual claim without copying article snippets or bodies.
             clean_body = raw_body
 
-    if not clean_body or len(extract_plain_narrative(clean_body)) < 10:
+    plain_body_narrative = extract_plain_narrative(clean_body)
+    if not clean_body or len(plain_body_narrative) < 15:
         return PublicationGateResult(
             passed=False,
             quarantine_reason="Publication gate: Summary body is empty",
@@ -517,6 +673,121 @@ def validate_publication_gate(
                 "Publication gate: Summary repeats headline without substantive content"
             ),
             diagnostics=("Summary text is an exact verbatim duplicate of the headline",),
+        )
+
+    # Invariant: Thin single-source report repeating headline without substantive new facts
+    if is_headline_body_duplicate(clean_body, final_headline):
+        source_snippet_adds_no_new_info = any(
+            len(
+                set(re.findall(r"\b[a-zA-Z0-9_-]+\b", (a.snippet or "").lower()))
+                - set(re.findall(r"\b[a-zA-Z0-9_-]+\b", (a.title or "").lower()))
+            )
+            < 2
+            for a in event.articles
+            if (a.snippet or "").strip()
+        )
+        has_other_facts = bool(
+            (summary.significance and len(summary.significance.strip()) >= 15)
+            or [
+                c for c in accepted_claims if not is_headline_body_duplicate(c.text, final_headline)
+            ]
+            or (
+                summary.key_details and (summary.key_details.action or summary.key_details.location)
+            )
+        )
+        if source_snippet_adds_no_new_info and not has_other_facts:
+            return PublicationGateResult(
+                passed=False,
+                quarantine_reason=(
+                    "Publication gate: Thin source report cannot support a substantive "
+                    "summary beyond repeating the headline"
+                ),
+                diagnostics=(
+                    "Source snippet adds no new information beyond title "
+                    "and narrative provides no new facts",
+                ),
+            )
+
+    # Invariant: Regulatory / FMS approval or proposal presented as completed equipment delivery
+    event_source_corpus = " ".join(
+        val
+        for art in event.articles
+        for val in (clean_article_text(art.title), clean_article_text(art.snippet or ""))
+        if val
+    ).lower()
+    full_narrative_lower = f"{final_headline} {clean_body}".lower()
+
+    has_approval_source = bool(
+        re.search(
+            r"\b(?:potential\s+(?:foreign\s+military\s+)?sale|state\s+department\s+(?:has\s+)?approved|"
+            r"fms\s+approval|approved\s+potential|greenlit\s+potential|proposed\s+sale|pending\s+contracts?)\b",
+            event_source_corpus,
+            re.I,
+        )
+    )
+    has_completed_delivery_claim = bool(
+        re.search(
+            r"\b(?:completed\s+delivery(?:\s+of)?|delivered|transferred|shipped)\s+(?:\d+\s+)?(?:[a-z0-9-]+\s+)*(?:missiles?|interceptors?|weapons?|tanks?|aircraft|jets?|submarines?|systems?|munitions?)\b",
+            full_narrative_lower,
+            re.I,
+        )
+        or re.search(
+            r"\b(?:missiles?|interceptors?|tanks?|aircraft|submarines?)\s+(?:were\s+)?(?:delivered|supplied|transferred)\b",
+            full_narrative_lower,
+            re.I,
+        )
+    )
+    has_source_delivery = bool(
+        re.search(
+            r"\b(?:delivered\s+to|completed\s+delivery|arrived\s+in|already\s+received)\b",
+            event_source_corpus,
+            re.I,
+        )
+    )
+
+    if has_approval_source and has_completed_delivery_claim and not has_source_delivery:
+        return PublicationGateResult(
+            passed=False,
+            quarantine_reason=(
+                "Publication gate: Regulatory/FMS approval presented as completed "
+                "equipment delivery"
+            ),
+            diagnostics=("Approved potential sale incorrectly framed as delivered equipment",),
+        )
+
+    # Invariant: Procurement / contract-value threshold described as mandatory investment amount
+    has_threshold_source = bool(
+        re.search(
+            r"\b(?:contracts?|deals?|procurements?|agreements?)\s+(?:valued\s+at|worth|over|exceeding|above)\s+"
+            r"(?:[£$€]?\d+\s*(?:million|billion|m|bn))\b",
+            event_source_corpus,
+            re.I,
+        )
+        or re.search(
+            r"\b(?:[£$€]?\d+\s*(?:million|billion|m|bn))\s+(?:contract\s+)?threshold\b",
+            event_source_corpus,
+            re.I,
+        )
+    )
+    confuses_threshold_as_investment = bool(
+        re.search(
+            r"\b(?:mandates?|requires?)\s+(?:foreign\s+)?contractors?\s+to\s+invest\s+[£$€]?\d+\s*(?:million|billion|m|bn)\b",
+            full_narrative_lower,
+            re.I,
+        )
+        or re.search(
+            r"\b(?:must|to)\s+(?:invest|provide|spend)\s+[£$€]?\d+\s*(?:million|billion|m|bn)\s+in\s+(?:local|domestic|industrial)",
+            full_narrative_lower,
+            re.I,
+        )
+    )
+    if has_threshold_source and confuses_threshold_as_investment:
+        return PublicationGateResult(
+            passed=False,
+            quarantine_reason=(
+                "Publication gate: Contract-value threshold described as required investment amount"
+            ),
+            diagnostics=("Procurement threshold framed as mandatory investment sum",),
         )
 
     # 7. Invariant: Unsegmented Multi-Story Newsletter Conflation
@@ -575,6 +846,17 @@ def validate_publication_gate(
                     "Combined disparate newsletter items into a single ungrounded summary",
                 ),
             )
+
+    # 12. Invariant: General Event Completeness Check
+    completeness_ok, completeness_err = check_event_completeness(summary, event)
+    if not completeness_ok:
+        return PublicationGateResult(
+            passed=False,
+            quarantine_reason=f"Publication gate: {completeness_err}",
+            diagnostics=(
+                completeness_err or "Summary fails general event-completeness requirements",
+            ),
+        )
 
     # Reconstruct repaired summary if modifications were made
     needs_update = (

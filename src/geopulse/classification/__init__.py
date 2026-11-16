@@ -15,12 +15,14 @@ def classify_text(
     title: str,
     snippet: str | None = None,
     source_name: str | None = None,
+    url: str | None = None,
 ) -> ClassificationResult:
     """Convenience helper to classify text using the default rule-based classifier."""
     return _DEFAULT_CLASSIFIER.classify_text(
         title=title,
         snippet=snippet,
         source_name=source_name,
+        url=url,
     )
 
 

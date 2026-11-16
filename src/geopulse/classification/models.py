@@ -15,6 +15,8 @@ class TopicCategory(StrEnum):
     MILITARY_OPERATIONS = "military_operations"
     DEFENCE_POLICY = "defence_policy"
     WEAPONS_PROCUREMENT = "weapons_procurement"
+    MILITARY_TECHNOLOGY = "military_technology"
+    INTELLIGENCE_ESPIONAGE = "intelligence_espionage"
     DIPLOMACY = "diplomacy"
     SANCTIONS = "sanctions"
     TERRORISM_INSURGENCY = "terrorism_insurgency"

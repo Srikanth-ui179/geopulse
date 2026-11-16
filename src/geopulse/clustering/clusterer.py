@@ -21,7 +21,15 @@ ANALYSIS_TITLE_PATTERNS: re.Pattern[str] = re.compile(
     r"\b(analysis|analyst\s+argues|analysts?\b|commentary|op-ed|opinion|interview|"
     r"exclusive interview|strategic review|perspective|cogs of war|book review|essay|"
     r"roundtable|discussion|podcast|debrief|newsletter|reading list|"
-    r"lessons?\s+(?:from|for)|should inform)\b",
+    r"lessons?\s+(?:from|for)|should inform|"
+    r"(?:is|are)\s+(?:destabilizing|dangerous|flawed|a\s+mistake|misguided|unnecessary|unworkable|doomed)|"
+    r"why\s+(?:the\s+)?.*?\s+(?:must|should|is|won['’]t|cannot|fails?)|"
+    r"the\s+case\s+(?:for|against)|"
+    r"time\s+to\s+(?:rethink|reconsider|abandon|escalate))\b",
+    re.I,
+)
+ANALYSIS_URL_PATTERNS: re.Pattern[str] = re.compile(
+    r"/(?:opinion|commentary|analysis|voices|ideas)/",
     re.I,
 )
 
@@ -82,6 +90,7 @@ class _ClusterBuilder:
         is_analysis = any(
             a.source_name.strip().lower() in ANALYSIS_SOURCES
             or bool(ANALYSIS_TITLE_PATTERNS.search(f"{a.title} {a.snippet or ''}"))
+            or bool(ANALYSIS_URL_PATTERNS.search(a.canonical_url or a.url or ""))
             for a in self.articles
         )
 
