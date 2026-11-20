@@ -70,12 +70,14 @@ def summarize_event(
     client: BaseLLMClient | None = None,
     fallback_client: BaseLLMClient | None = None,
     settings: "Settings | None" = None,
+    enable_extractive_fallback: bool = True,
 ) -> SummarizationResult:
     """Convenience helper to summarize a single EventCluster."""
     summarizer = EventSummarizer(
         client=client,
         fallback_client=fallback_client,
         settings=settings,
+        enable_extractive_fallback=enable_extractive_fallback,
     )
     return summarizer.summarize_event(event)
 
@@ -88,12 +90,14 @@ def summarize_events(
     max_events: int | None = None,
     min_relevance_rank: float | None = None,
     include_low_priority: bool = False,
+    enable_extractive_fallback: bool = True,
 ) -> tuple[SummarizationResult, ...]:
     """Convenience helper to summarize multiple EventClusters."""
     summarizer = EventSummarizer(
         client=client,
         fallback_client=fallback_client,
         settings=settings,
+        enable_extractive_fallback=enable_extractive_fallback,
     )
     return summarizer.summarize_events(
         events,

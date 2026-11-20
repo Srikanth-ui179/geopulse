@@ -167,7 +167,7 @@ def test_gemini_defaults_and_provider_settings(monkeypatch):
     s = Settings(_env_file=None)
     assert s.llm_provider == "ollama"
     assert s.gemini_api_key is None
-    assert s.gemini_model == "gemini-3.8-flash"
+    assert s.gemini_model == "gemini-3.5-flash-lite"
     assert s.gemini_base_url == "https://generativelanguage.googleapis.com"
     assert s.is_gemini_configured is False
 

@@ -57,9 +57,13 @@ from geopulse.summarization.prompts import (
     build_grounding_correction_prompt,
 )
 from geopulse.summarization.publication_gate import (
+    _NEWSLETTER_INTRO_PATTERN,
+    _SPONSORED_PATTERN,
     clean_awkward_attribution_prefix,
     is_headline_body_duplicate,
     normalize_attribution_text,
+    strip_leading_headline_duplicate,
+    strip_wire_dateline,
     validate_publication_gate,
 )
 from geopulse.summarization.validator import (
@@ -731,8 +735,10 @@ class EventSummarizer:
         settings: Settings | None = None,
         extractor: ArticleExtractor | None = None,
         nli_verifier: Any | None = None,
+        enable_extractive_fallback: bool = True,
     ) -> None:
         self.settings = settings or get_settings()
+        self.enable_extractive_fallback = enable_extractive_fallback
         if client is not None:
             self.client = client
             self.fallback_client = fallback_client
@@ -2492,6 +2498,278 @@ class EventSummarizer:
             None,
         )
 
+    def _build_extractive_fallback_summary(
+        self,
+        event: EventCluster,
+        sources: Sequence[EventSourceAttribution],
+        model_used: str,
+    ) -> EventSummary:
+        """Construct a high-quality, fully grounded extractive summary from event articles."""
+        if not sources:
+            sources = tuple(
+                EventSourceAttribution(
+                    source_name=art.source_name,
+                    title=art.title,
+                    url=art.url,
+                    published_at=art.published_at,
+                )
+                for art in event.articles
+            )
+
+        src_fallback = event.articles[0].title if event.articles else None
+        headline = clean_headline_grammar(event.title, source_title=src_fallback)
+        headline = strip_wire_dateline(headline)
+        headline = clean_awkward_attribution_prefix(headline)
+        if getattr(event, "is_update", False) and not headline.startswith("[UPDATE]"):
+            headline = f"[UPDATE] {headline}"
+
+        combined_src_parts = []
+        for a in event.articles:
+            t = clean_article_text(a.title)
+            s = clean_article_text(getattr(a, "body_text", None) or a.snippet or "")
+            if t:
+                sep = " " if t.endswith((".", "!", "?")) else ". "
+                combined_src_parts.append(f"{t}{sep}{s}".strip())
+            elif s:
+                combined_src_parts.append(s)
+        combined_src_text = " ".join(combined_src_parts)
+
+        location = ground_event_location(None, event, combined_src_text)
+        if not location and event.region:
+            location = ground_event_location(event.region, event, combined_src_text)
+
+        cand_actors: list[str] = []
+        event_titles = tuple(a.title for a in event.articles if getattr(a, "title", None))
+        event_source_names = [a.source_name for a in event.articles if a.source_name]
+        extracted_caps = re.findall(
+            r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b",
+            combined_src_text[:400],
+        )
+        for word in extracted_caps:
+            w_lower = word.lower()
+            if (
+                len(word) > 2
+                and w_lower
+                not in {
+                    "breaking",
+                    "defense",
+                    "news",
+                    "report",
+                    "update",
+                    "analysis",
+                    "read",
+                    "october",
+                    "november",
+                    "december",
+                    "january",
+                    "monday",
+                    "tuesday",
+                }
+                and w_lower not in _NON_ACTOR_NOUNS
+                and w_lower not in _INVALID_ACTOR_TOKENS
+                and not is_polluted_actor(word, event_titles=event_titles)
+            ):
+                if word not in cand_actors:
+                    cand_actors.append(word)
+        actors = (
+            tuple(
+                sanitize_actors(
+                    cand_actors[:4],
+                    source_names=event_source_names,
+                    event_titles=event_titles,
+                )
+            )
+            if cand_actors
+            else ()
+        )
+
+        action = clean_concise_action(headline) or safe_truncate_headline(headline, max_chars=100)
+        earliest_pub = min((a.published_at for a in event.articles if a.published_at), default=None)
+        timing = earliest_pub.strftime("%B %d, %Y") if earliest_pub else None
+
+        key_details = EventKeyDetails(
+            actors=actors,
+            location=location,
+            timing=timing,
+            action=action,
+        )
+
+        substantive_sentences: list[str] = []
+        for art in event.articles:
+            body_or_snippet = getattr(art, "body_text", None) or art.snippet or ""
+            cleaned = clean_article_text(body_or_snippet)
+            cleaned = strip_wire_dateline(cleaned)
+            cleaned = strip_leading_headline_duplicate(cleaned, headline)
+            if not cleaned:
+                continue
+            sents = split_sentences_safely(cleaned)
+            for sent in sents:
+                sent_clean = sent.strip()
+                if (
+                    len(sent_clean) >= 20
+                    and not _NEWSLETTER_INTRO_PATTERN.search(sent_clean)
+                    and not _SPONSORED_PATTERN.search(sent_clean)
+                    and not is_headline_body_duplicate(sent_clean, headline)
+                    and sent_clean not in substantive_sentences
+                ):
+                    substantive_sentences.append(sent_clean)
+                    if len(substantive_sentences) >= 3:
+                        break
+            if len(substantive_sentences) >= 3:
+                break
+
+        if substantive_sentences:
+            what_happened = " ".join(substantive_sentences)
+        else:
+            primary_source = event.articles[0].source_name if event.articles else "Sources"
+            clean_h = headline.rstrip(".!? ")
+            what_happened = f"{primary_source} reports that {clean_h[0].lower() + clean_h[1:]}."
+
+        what_happened = sanitize_technical_acronyms(what_happened, combined_src_text)
+        headline = sanitize_technical_acronyms(headline, combined_src_text)
+
+        best_art = event.articles[0] if event.articles else None
+        best_span = ""
+        if best_art:
+            best_span = clean_article_text(best_art.title)
+            for art in event.articles:
+                snip = clean_article_text(art.snippet or "")
+                if snip and len(snip) >= 20:
+                    best_art = art
+                    sents = split_sentences_safely(snip)
+                    best_span = sents[0] if sents else snip
+                    break
+
+        claims: tuple[SummaryClaim, ...] = ()
+        if best_art and best_span:
+            ev_ref = ClaimEvidenceReference(
+                source_url=best_art.url,
+                evidence_span=best_span,
+                verification_status="accepted",
+                provenance="full_article"
+                if getattr(best_art, "is_full_text", False)
+                else "rss_snippet",
+                article_id=getattr(best_art, "article_id", None),
+                article_revision_id=getattr(best_art, "current_revision_id", None),
+                content_hash=getattr(best_art, "content_hash", None),
+            )
+            central_claim = SummaryClaim(
+                claim_id="claim-1",
+                text=what_happened
+                if len(what_happened) <= 240
+                else safe_truncate_headline(what_happened, max_chars=240),
+                evidence_refs=(ev_ref,),
+                classification="reported_fact",
+                central=True,
+                verification_status="accepted",
+                article_id=getattr(best_art, "article_id", None),
+                article_revision_id=getattr(best_art, "current_revision_id", None),
+            )
+            claims = (central_claim,)
+
+        if event.confidence_label == "corroborated" and len(event.articles) >= 2:
+            confidence_qual = (
+                f"Corroborated across {len(event.articles)} reporting outlets; "
+                "military claims unconfirmed independently."
+            )
+        elif len(event.articles) >= 2:
+            confidence_qual = "Syndicated reporting across outlets; not independently corroborated."
+        else:
+            source_name = event.articles[0].source_name if event.articles else "Single source"
+            confidence_qual = f"Single-source report from {source_name}; unverified independently."
+
+        if event.confidence_label == "corroborated" and len(event.articles) >= 2:
+            corrob_status = "multiple_reports_shared_origin"
+        else:
+            corrob_status = "single_source"
+
+        return EventSummary(
+            event_id=event.id,
+            headline=headline,
+            what_happened=what_happened,
+            key_details=key_details,
+            confidence_qualification=confidence_qual,
+            sources=sources,
+            claims=claims,
+            model_used=model_used,
+            corroboration_status=corrob_status,
+            independent_chains_count=1,
+        )
+
+    def _attempt_extractive_fallback(
+        self,
+        event: EventCluster,
+        sources: Sequence[EventSourceAttribution],
+        model_used: str,
+        original_event: EventCluster,
+        event_hash: str,
+        error_context: str | None = None,
+    ) -> SummarizationResult:
+        """Attempt to construct and validate an extractive fallback summary."""
+        try:
+            fallback_summary = self._build_extractive_fallback_summary(
+                event=event,
+                sources=sources,
+                model_used=model_used,
+            )
+            validation_res = validate_summary_grounding(fallback_summary, event)
+            if not validation_res.is_valid and validation_res.unsupported_entities:
+                unsupported_set = {e.lower() for e in validation_res.unsupported_entities}
+                clean_actors = tuple(
+                    a
+                    for a in fallback_summary.key_details.actors
+                    if a.lower() not in unsupported_set
+                )
+                fallback_summary = fallback_summary.model_copy(
+                    update={
+                        "key_details": fallback_summary.key_details.model_copy(
+                            update={"actors": clean_actors}
+                        )
+                    }
+                )
+                validation_res = validate_summary_grounding(fallback_summary, event)
+
+            if validation_res.is_valid:
+                gate_res = validate_publication_gate(fallback_summary, event)
+                if gate_res.passed:
+                    final_summary = gate_res.repaired_summary or fallback_summary
+                    res = SummarizationResult(
+                        event_id=event.id,
+                        status="success",
+                        summary=final_summary,
+                        event=original_event,
+                    )
+                    self._cache[event_hash] = res
+                    return res
+                else:
+                    logger.warning(
+                        "Extractive fallback for event %s failed publication gate: %s",
+                        event.id,
+                        gate_res.quarantine_reason,
+                    )
+            else:
+                logger.warning(
+                    "Extractive fallback for event %s failed grounding validation: %s",
+                    event.id,
+                    validation_res.quarantine_reason,
+                )
+        except Exception as exc:
+            logger.error(
+                "Failed to build extractive fallback for event %s: %s",
+                event.id,
+                exc,
+                exc_info=True,
+            )
+
+        res = SummarizationResult(
+            event_id=event.id,
+            status="failed",
+            error_message=error_context or "Extractive fallback failed",
+            event=original_event,
+        )
+        self._cache[event_hash] = res
+        return res
+
     def summarize_event(self, event: EventCluster) -> SummarizationResult:
         """Summarize a single EventCluster with evidence sufficiency and deterministic grounding."""
         original_event = event
@@ -2581,6 +2859,24 @@ class EventSummarizer:
                         },
                     )
                 except OllamaUnavailableError as fallback_exc:
+                    if self.enable_extractive_fallback:
+                        logger.warning(
+                            "Primary provider failed (%s) and fallback Ollama is unavailable (%s); "
+                            "degrading to extractive fallback",
+                            exc,
+                            fallback_exc,
+                        )
+                        return self._attempt_extractive_fallback(
+                            event=event,
+                            sources=sources,
+                            model_used=f"{model_used}:extractive-fallback",
+                            original_event=original_event,
+                            event_hash=event_hash,
+                            error_context=(
+                                f"Primary provider failed ({exc}) and "
+                                f"fallback Ollama unavailable ({fallback_exc})"
+                            ),
+                        )
                     res = SummarizationResult(
                         event_id=event.id,
                         status="unavailable",
@@ -2597,6 +2893,24 @@ class EventSummarizer:
                     OllamaModelNotFoundError,
                     OllamaResponseError,
                 ) as fallback_exc:
+                    if self.enable_extractive_fallback:
+                        logger.warning(
+                            "Primary provider failed (%s) and fallback Ollama failed (%s); "
+                            "degrading to extractive fallback",
+                            exc,
+                            fallback_exc,
+                        )
+                        return self._attempt_extractive_fallback(
+                            event=event,
+                            sources=sources,
+                            model_used=f"{model_used}:extractive-fallback",
+                            original_event=original_event,
+                            event_hash=event_hash,
+                            error_context=(
+                                f"Primary provider failed ({exc}) and "
+                                f"fallback Ollama failed ({fallback_exc})"
+                            ),
+                        )
                     res = SummarizationResult(
                         event_id=event.id,
                         status="failed",
@@ -2609,6 +2923,24 @@ class EventSummarizer:
                     self._cache[event_hash] = res
                     return res
                 except Exception as fallback_exc:
+                    if self.enable_extractive_fallback:
+                        logger.warning(
+                            "Primary provider failed (%s) and fallback Ollama error (%s); "
+                            "degrading to extractive fallback",
+                            exc,
+                            fallback_exc,
+                        )
+                        return self._attempt_extractive_fallback(
+                            event=event,
+                            sources=sources,
+                            model_used=f"{model_used}:extractive-fallback",
+                            original_event=original_event,
+                            event_hash=event_hash,
+                            error_context=(
+                                f"Primary provider failed ({exc}) and "
+                                f"fallback Ollama error ({fallback_exc})"
+                            ),
+                        )
                     res = SummarizationResult(
                         event_id=event.id,
                         status="failed",
@@ -2621,6 +2953,28 @@ class EventSummarizer:
                     self._cache[event_hash] = res
                     return res
             else:
+                if self.enable_extractive_fallback and isinstance(
+                    exc,
+                    (
+                        GeminiQuotaError,
+                        GeminiTimeoutError,
+                        GeminiUnavailableError,
+                        GeminiResponseError,
+                    ),
+                ):
+                    logger.warning(
+                        "Primary Gemini provider encountered %s and no fallback client configured; "
+                        "degrading to deterministic extractive fallback",
+                        exc,
+                    )
+                    return self._attempt_extractive_fallback(
+                        event=event,
+                        sources=sources,
+                        model_used=f"{model_used}:extractive-fallback",
+                        original_event=original_event,
+                        event_hash=event_hash,
+                        error_context=f"Gemini error: {exc}",
+                    )
                 status_label = (
                     "unavailable" if isinstance(exc, GeminiUnavailableError) else "failed"
                 )
@@ -2633,6 +2987,19 @@ class EventSummarizer:
                 self._cache[event_hash] = res
                 return res
         except (OllamaUnavailableError, GeminiUnavailableError) as exc:
+            if self.enable_extractive_fallback and isinstance(exc, GeminiUnavailableError):
+                logger.warning(
+                    "Gemini provider unavailable (%s); degrading to extractive fallback",
+                    exc,
+                )
+                return self._attempt_extractive_fallback(
+                    event=event,
+                    sources=sources,
+                    model_used=f"{model_used}:extractive-fallback",
+                    original_event=original_event,
+                    event_hash=event_hash,
+                    error_context=str(exc),
+                )
             res = SummarizationResult(
                 event_id=event.id,
                 status="unavailable",
@@ -2652,6 +3019,27 @@ class EventSummarizer:
             GeminiModelNotFoundError,
             GeminiResponseError,
         ) as exc:
+            if self.enable_extractive_fallback and isinstance(
+                exc,
+                (
+                    GeminiQuotaError,
+                    GeminiTimeoutError,
+                    GeminiModelNotFoundError,
+                    GeminiResponseError,
+                ),
+            ):
+                logger.warning(
+                    "Gemini provider error (%s); degrading to extractive fallback",
+                    exc,
+                )
+                return self._attempt_extractive_fallback(
+                    event=event,
+                    sources=sources,
+                    model_used=f"{model_used}:extractive-fallback",
+                    original_event=original_event,
+                    event_hash=event_hash,
+                    error_context=str(exc),
+                )
             res = SummarizationResult(
                 event_id=event.id,
                 status="failed",
@@ -2661,6 +3049,23 @@ class EventSummarizer:
             self._cache[event_hash] = res
             return res
         except Exception as exc:
+            if (
+                self.enable_extractive_fallback
+                and getattr(active_client, "provider", None) == "gemini"
+            ):
+                logger.warning(
+                    "Unexpected error during Gemini summarization (%s); "
+                    "degrading to extractive fallback",
+                    exc,
+                )
+                return self._attempt_extractive_fallback(
+                    event=event,
+                    sources=sources,
+                    model_used=f"{model_used}:extractive-fallback",
+                    original_event=original_event,
+                    event_hash=event_hash,
+                    error_context=f"Unexpected error during summarization: {exc}",
+                )
             res = SummarizationResult(
                 event_id=event.id,
                 status="failed",
@@ -2723,6 +3128,21 @@ class EventSummarizer:
                     parse_error = f"Bounded claim correction failed: {type(exc).__name__}"
 
             if candidate_summary is None:
+                if (
+                    self.enable_extractive_fallback
+                    and getattr(active_client, "provider", None) == "gemini"
+                ):
+                    extractive_res = self._attempt_extractive_fallback(
+                        event=event,
+                        sources=sources,
+                        model_used=f"{model_used}:extractive-fallback",
+                        original_event=original_event,
+                        event_hash=event_hash,
+                        error_context=parse_error or "Candidate summary parsing failed",
+                    )
+                    if extractive_res.status == "success":
+                        return extractive_res
+
                 last_done = getattr(active_client, "last_metrics", {}).get("done_reason")
                 is_truncated = (
                     last_done == "length"

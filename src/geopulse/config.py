@@ -37,7 +37,7 @@ class Settings(BaseSettings):
 
     llm_provider: Literal["ollama", "gemini", "auto"] = "ollama"
     gemini_api_key: SecretStr | None = None
-    gemini_model: str = "gemini-3.8-flash"
+    gemini_model: str = "gemini-3.5-flash-lite"
     gemini_base_url: str = "https://generativelanguage.googleapis.com"
     gemini_timeout: float = 30.0
     gemini_max_retries: int = 2

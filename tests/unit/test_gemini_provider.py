@@ -446,14 +446,57 @@ def test_event_summarizer_gemini_mode_does_not_fall_back_on_error():
         should_quota_exhaust=True,
     )
 
-    # In gemini-only mode (no fallback_client provided)
-    summarizer = EventSummarizer(client=mock_gemini, fallback_client=None)
+    # In gemini-only mode with extractive fallback disabled (no fallback_client provided)
+    summarizer = EventSummarizer(
+        client=mock_gemini, fallback_client=None, enable_extractive_fallback=False
+    )
     res = summarizer.summarize_event(event)
 
     # Must fail without falling back to Ollama
     assert res.status == "failed"
     assert res.summary is None
     assert "quota exceeded" in (res.error_message or "").lower()
+
+
+def test_gemini_quota_error_triggers_extractive_fallback():
+    event = _create_sample_cluster()
+    mock_gemini = MockGeminiClient(
+        model="mock-gemini-2.5-flash",
+        should_quota_exhaust=True,
+    )
+
+    # By default, enable_extractive_fallback is True
+    summarizer = EventSummarizer(client=mock_gemini, fallback_client=None)
+    res = summarizer.summarize_event(event)
+
+    # Gracefully degrades to deterministic extractive fallback
+    assert res.status == "success"
+    assert res.summary is not None
+    assert res.summary.model_used == "mock-gemini-2.5-flash:extractive-fallback"
+    assert len(res.summary.headline) >= 5
+    assert len(res.summary.what_happened) >= 10
+    assert len(res.summary.claims) >= 1
+    assert res.summary.claims[0].central is True
+    assert res.summary.claims[0].verification_status == "accepted"
+    assert len(mock_gemini.calls) == 1
+
+
+def test_gemini_timeout_triggers_extractive_fallback():
+    event = _create_sample_cluster()
+    mock_gemini = MockGeminiClient(
+        model="mock-gemini-2.5-flash",
+        should_timeout=True,
+    )
+
+    summarizer = EventSummarizer(client=mock_gemini, fallback_client=None)
+    res = summarizer.summarize_event(event)
+
+    assert res.status == "success"
+    assert res.summary is not None
+    assert res.summary.model_used == "mock-gemini-2.5-flash:extractive-fallback"
+    assert len(res.summary.headline) >= 5
+    assert len(res.summary.what_happened) >= 10
+    assert len(mock_gemini.calls) == 1
 
 
 def test_event_summarizer_auto_mode_falls_back_on_transient_error():
@@ -536,7 +579,8 @@ def test_event_summarizer_timeout_fallback_and_explicit_gemini_behavior():
     assert len(mock_gemini_auto.calls) == 1
     assert len(mock_ollama_fallback.calls) == 1
 
-    # Part 2: explicit Gemini mode (fallback_client=None) fails closed on timeout without Ollama
+    # Part 2: explicit Gemini mode with extractive fallback disabled
+    # fails closed on timeout without Ollama
     mock_gemini_explicit = MockGeminiClient(
         model="mock-gemini-3.8-flash",
         should_timeout=True,
@@ -544,6 +588,7 @@ def test_event_summarizer_timeout_fallback_and_explicit_gemini_behavior():
     explicit_summarizer = EventSummarizer(
         client=mock_gemini_explicit,
         fallback_client=None,
+        enable_extractive_fallback=False,
     )
     res_explicit = explicit_summarizer.summarize_event(event)
 
