@@ -1,9 +1,12 @@
 """RSS Ingestion orchestration service."""
 
+from __future__ import annotations
+
 import concurrent.futures
 import logging
 import threading
 import time
+from typing import Any
 
 from geopulse.config import Settings, get_settings
 from geopulse.ingestion.feeds import get_default_feeds
@@ -25,7 +28,7 @@ def ingest_feed(
     limit: int | None = None,
     repository: ArticleRepository | None = None,
     dry_run: bool = True,
-    repo_lock: threading.Lock | None = None,
+    repo_lock: Any | None = None,
 ) -> FeedIngestionResult:
     """Ingest articles from a single feed.
 

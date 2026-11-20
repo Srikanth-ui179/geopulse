@@ -62,6 +62,9 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
             echo "Executing Geopulse daily briefing in PREVIEW mode..."
             python -m geopulse.cli brief --preview --edition daily --max-events 6 --candidate-cap 8
+          elif [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "Telegram credentials not configured in repository secrets; running in PREVIEW mode..."
+            python -m geopulse.cli brief --preview --edition daily --max-events 6 --candidate-cap 8
           else
             echo "Executing Geopulse daily briefing in LIVE SEND mode..."
             python -m geopulse.cli brief --send --edition daily --max-events 6 --candidate-cap 8
