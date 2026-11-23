@@ -499,6 +499,41 @@ def test_gemini_timeout_triggers_extractive_fallback():
     assert len(mock_gemini.calls) == 1
 
 
+def test_gemini_model_not_found_triggers_extractive_fallback():
+    event = _create_sample_cluster()
+    mock_gemini = MockGeminiClient(
+        model="mock-gemini-2.5-flash",
+        should_model_not_found=True,
+    )
+
+    summarizer = EventSummarizer(client=mock_gemini, fallback_client=None)
+    res = summarizer.summarize_event(event)
+
+    assert res.status == "success"
+    assert res.summary is not None
+    assert res.summary.model_used == "mock-gemini-2.5-flash:extractive-fallback"
+    assert len(res.summary.headline) >= 5
+    assert len(res.summary.what_happened) >= 10
+    assert len(mock_gemini.calls) == 1
+
+
+def test_gemini_response_error_triggers_extractive_fallback():
+    event = _create_sample_cluster()
+    mock_gemini = MockGeminiClient(
+        model="mock-gemini-2.5-flash",
+        should_return_malformed=True,
+    )
+
+    summarizer = EventSummarizer(client=mock_gemini, fallback_client=None)
+    res = summarizer.summarize_event(event)
+
+    assert res.status == "success"
+    assert res.summary is not None
+    assert res.summary.model_used == "mock-gemini-2.5-flash:extractive-fallback"
+    assert len(res.summary.headline) >= 5
+    assert len(res.summary.what_happened) >= 10
+
+
 def test_event_summarizer_auto_mode_falls_back_on_transient_error():
     event = _create_sample_cluster()
     # Gemini client experiences 503 unavailable

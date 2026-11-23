@@ -265,7 +265,7 @@ def split_sentences_safely(text: str) -> list[str]:
     protected = re.sub(
         r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.",
         r"\1@@DOT@@",
-        text,
+        protected,
         flags=re.I,
     )
     # Protect dotted initialisms and civil/military titles
@@ -273,6 +273,24 @@ def split_sentences_safely(text: str) -> list[str]:
         r"\b(U\.S|U\.K|E\.U|U\.N|Gen|Lt|Col|Maj|Capt|Adm|Cmdr|Sgt|Dr|Mr|Mrs|Ms|Prof|Sen|Rep)\.",
         r"\1@@DOT@@",
         protected,
+    )
+    # Protect currency and decimal numbers (e.g., $16.5, $16. 5, €15.2, 16.5%, $16. million)
+    protected = re.sub(
+        r"([$€£¥₹]?\s*\d+)\.(\s*)(\d+)",
+        r"\1@@DOT@@\2\3",
+        protected,
+    )
+    protected = re.sub(
+        r"([$€£¥₹]\s*\d+)\.(\s*)(million|billion|trillion|[mbk]\b)",
+        r"\1@@DOT@@\2\3",
+        protected,
+        flags=re.I,
+    )
+    protected = re.sub(
+        r"\b(No|vol|sec|art|para|al|vs|dept|approx|est)\.(\s*)(\d+)",
+        r"\1@@DOT@@\2\3",
+        protected,
+        flags=re.I,
     )
     sentences = [
         s.replace("@@DOT@@", ".").strip()

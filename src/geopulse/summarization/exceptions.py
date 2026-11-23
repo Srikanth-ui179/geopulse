@@ -62,10 +62,13 @@ class GeminiResponseError(GeminiError):
 
 
 # Explicitly defined eligible exceptions for fallback from Gemini to Ollama in 'auto' mode.
-# Transient server errors, network connectivity/timeout errors, and quota exhaustion
-# trigger fallback. Authentication and configuration errors are non-transient and do NOT fall back.
+# Transient server errors, network connectivity/timeout errors, quota exhaustion,
+# missing models, and response/schema errors trigger fallback. Authentication and
+# configuration errors are non-transient and do NOT fall back.
 GEMINI_FALLBACK_ELIGIBLE_EXCEPTIONS: tuple[type[Exception], ...] = (
     GeminiUnavailableError,
     GeminiTimeoutError,
     GeminiQuotaError,
+    GeminiModelNotFoundError,
+    GeminiResponseError,
 )

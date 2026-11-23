@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 from geopulse.clustering.models import EventCluster
 from geopulse.ingestion.normalization import normalize_url
+from geopulse.summarization.evidence_matcher import split_sentences_safely
 from geopulse.summarization.models import EventSummary
 
 _DEMONYM_SUBJECT_MAP: dict[str, str] = {
@@ -298,7 +299,9 @@ _DANGLING_ENDINGS = re.compile(
     r"danish|swedish|norwegian|finnish|polish|saudi|turkish|yemeni|houthi|syrian|iraqi|lebanese|"
     r"military|naval|air|joint|nuclear|strategic|conventional|tactical|bilateral|multilateral|"
     # Auxiliary and modal verbs
-    r"is|are|was|were|be|been|being|have|has|had|do|does|did|will|would|shall|should|may|might|must|can|could"
+    r"is|are|was|were|be|been|being|have|has|had|do|does|did|will|would|shall|should|may|might|must|can|could|"
+    # Truncated currency or numbers
+    r"[$€£¥₹]\s*\d*\.?|\(\s*[$€£¥₹]?\d*\.?"
     r")\s*$",
     re.I,
 )
@@ -330,9 +333,9 @@ def safe_truncate_headline(text: str, max_chars: int = 140) -> str:
         return cleaned.rstrip(" ,;:-\t")
 
     # 1. Try first complete sentence if within limits
-    sentence_match = re.search(r"^([^.!?]+[.!?])", cleaned)
-    if sentence_match:
-        first_sentence = sentence_match.group(1).strip()
+    sents = split_sentences_safely(cleaned)
+    if sents:
+        first_sentence = sents[0].strip()
         if 20 <= len(first_sentence) <= max_chars:
             cand = first_sentence.rstrip(" ,;:-\t")
             for _ in range(3):
@@ -1512,6 +1515,7 @@ _DEMONYM_SYNONYMS: dict[str, tuple[str, ...]] = {
     "saudi arabia": ("saudi arabia", "saudi"),
     "taiwanese": ("taiwan", "taiwanese"),
     "taiwan": ("taiwan", "taiwanese"),
+    "korea": ("south korea", "korea", "korean"),
     "korean": ("south korea", "korea", "korean"),
     "south korea": ("south korea", "korea", "korean"),
     "indian": ("india", "indian"),
@@ -1554,6 +1558,38 @@ _GENERIC_BRANCH_DESCRIPTORS: frozenset[str] = frozenset(
         "troops",
         "fighters",
         "pilots",
+    }
+)
+
+_GENERIC_TITLES_AND_RANKS: frozenset[str] = frozenset(
+    {
+        "general",
+        "gen",
+        "admiral",
+        "adm",
+        "secretary",
+        "sec",
+        "president",
+        "prime",
+        "minister",
+        "colonel",
+        "col",
+        "captain",
+        "commander",
+        "cmd",
+        "major",
+        "maj",
+        "lieutenant",
+        "lt",
+        "governor",
+        "gov",
+        "chancellor",
+        "premier",
+        "ambassador",
+        "amb",
+        "director",
+        "deputy",
+        "marshal",
     }
 )
 
@@ -2317,8 +2353,8 @@ def detect_malformed_clauses(text: str) -> list[str]:
     if not text:
         return []
     issues: list[str] = []
-    # Split by sentence boundaries
-    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
+    # Split by sentence boundaries safely
+    sentences = split_sentences_safely(text)
     for s in sentences:
         s_clean = s.strip()
         for pat in _MALFORMED_CLAUSE_PATTERNS:
@@ -2545,6 +2581,10 @@ def validate_summary_grounding(
     for art in event.articles:
         corpus_items.append(art.title)
         article_text_items.append(art.title)
+        body = getattr(art, "body_text", None)
+        if body:
+            corpus_items.append(body)
+            article_text_items.append(body)
         if art.snippet:
             corpus_items.append(art.snippet)
             article_text_items.append(art.snippet)
@@ -2742,7 +2782,8 @@ def validate_summary_grounding(
         actor_tokens = [
             tok.lower()
             for tok in re.findall(r"\b[a-zA-Z0-9_\u00C0-\u017F-]+\b", stripped)
-            if len(tok) >= 3 and tok.lower() not in _STOP_WORDS
+            if (len(tok) >= 3 or tok.lower() in {"us", "uk", "eu", "un"})
+            and tok.lower() not in _STOP_WORDS
         ]
 
         if not actor_tokens:
@@ -2760,17 +2801,22 @@ def validate_summary_grounding(
         if not entity_tokens:
             continue
 
+        # If person name includes title/rank (e.g. 'General Mark Milley'), don't let the generic
+        # title alone ground an otherwise unmentioned entity if distinctive name tokens exist
+        name_tokens = [tok for tok in entity_tokens if tok not in _GENERIC_TITLES_AND_RANKS]
+        check_tokens = name_tokens if name_tokens else entity_tokens
+
         # Verify whether the substantive entity tokens appear in source (including demonyms)
         entity_grounded = any(
             tok in source_tokens
-            or tok in source_lower
             or (
                 tok in _DEMONYM_SYNONYMS
                 and any(
-                    syn in source_tokens or syn in source_lower for syn in _DEMONYM_SYNONYMS[tok]
+                    syn in source_tokens if " " not in syn else syn in source_lower
+                    for syn in _DEMONYM_SYNONYMS[tok]
                 )
             )
-            for tok in entity_tokens
+            for tok in check_tokens
         )
 
         if not entity_grounded:
@@ -3362,7 +3408,14 @@ def validate_summary_grounding(
     )
     count_40_plus = r"(?:\b40\s*\+|\b40[- ]plus\b|\bmore than 40\b|\bover 40\b|\bforty[- ]plus\b)"
     uncrewed_terms = r"\b(?:uncrewed|unmanned|autonomous)\b"
-    source_has_40_plus = bool(re.search(count_40_plus, source_lower, re.I))
+    tech_terms = r"(?:technolog\w*|systems?|assets?|uncrewed|unmanned|autonomous)"
+    source_has_40_plus = bool(
+        re.search(
+            rf"{count_40_plus}[^.!?]{{0,35}}{tech_terms}|{tech_terms}[^.!?]{{0,35}}{count_40_plus}",
+            source_lower,
+            re.I,
+        )
+    )
     summary_has_40_plus = bool(re.search(count_40_plus, summary_text, re.I))
     source_counts_uncrewed = bool(
         re.search(

@@ -1104,3 +1104,21 @@ def test_formatter_omits_orphaned_source_line_on_single_claim_duplicate():
     for line in lines:
         assert not (line.startswith("<i>(<a") and line.endswith("</a>)</i>"))
         assert line != '<i>(<a href="https://laprensa.pa/article/1">La Prensa</a>)</i>'
+
+
+def test_split_sentences_safely_protects_currency_and_decimals():
+    """Verify currency figures and decimal numbers are not truncated."""
+    text = (
+        "The defence ministry approved a package of $16. 5 million for border security. "
+        "Separately, €12.4 billion was allocated for joint procurement."
+    )
+    passages = split_sentences_safely(text)
+    assert len(passages) == 2
+    assert "$16. 5 million" in passages[0]
+    assert "€12.4 billion" in passages[1]
+
+    # Also test detect_malformed_clauses does not falsely flag currency decimals
+    from geopulse.summarization.validator import detect_malformed_clauses
+
+    issues = detect_malformed_clauses(text)
+    assert len(issues) == 0

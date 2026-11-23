@@ -2713,17 +2713,30 @@ class EventSummarizer:
                 model_used=model_used,
             )
             validation_res = validate_summary_grounding(fallback_summary, event)
-            if not validation_res.is_valid and validation_res.unsupported_entities:
-                unsupported_set = {e.lower() for e in validation_res.unsupported_entities}
-                clean_actors = tuple(
-                    a
-                    for a in fallback_summary.key_details.actors
-                    if a.lower() not in unsupported_set
-                )
+            if not validation_res.is_valid:
+                new_actors = fallback_summary.key_details.actors
+                new_location = fallback_summary.key_details.location
+                if validation_res.unsupported_entities:
+                    unsupported_set = {e.lower() for e in validation_res.unsupported_entities}
+                    new_actors = tuple(
+                        a for a in new_actors if a.lower() not in unsupported_set
+                    )
+                    if new_location and new_location.lower() in unsupported_set:
+                        new_location = None
                 fallback_summary = fallback_summary.model_copy(
                     update={
                         "key_details": fallback_summary.key_details.model_copy(
-                            update={"actors": clean_actors}
+                            update={"actors": new_actors, "location": new_location}
+                        )
+                    }
+                )
+                validation_res = validate_summary_grounding(fallback_summary, event)
+
+            if not validation_res.is_valid and fallback_summary.key_details.actors:
+                fallback_summary = fallback_summary.model_copy(
+                    update={
+                        "key_details": fallback_summary.key_details.model_copy(
+                            update={"actors": ()}
                         )
                     }
                 )
@@ -2960,6 +2973,7 @@ class EventSummarizer:
                         GeminiTimeoutError,
                         GeminiUnavailableError,
                         GeminiResponseError,
+                        GeminiModelNotFoundError,
                     ),
                 ):
                     logger.warning(
@@ -3026,6 +3040,7 @@ class EventSummarizer:
                     GeminiTimeoutError,
                     GeminiModelNotFoundError,
                     GeminiResponseError,
+                    GeminiUnavailableError,
                 ),
             ):
                 logger.warning(
